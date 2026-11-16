@@ -178,3 +178,17 @@ Gate per step: a probe command (extend `gliff-probe`) proves the step on a real 
 
 - After M0: if only the portal route works, do you accept one remembered approval click per workstation?
 - After M1: are you happy for me to open the "backend interface" issue upstream? That is outward-facing, so I'll draft it and you post it.
+
+## Decisions and results log
+
+### M0 result (2026-11-15) — spike run on a vexos desktop VM (GNOME Shell 50.6, software rendering)
+
+- Over SSH, with nobody at the machine: RemoteDesktop + ScreenCast sessions, `RecordMonitor` and `RecordVirtual` (shared-memory frames with real pixels), and the clipboard (two sessions, both directions) all worked with no prompt reaching the caller.
+- Key, pointer and scroll calls were accepted; their effect on the desktop was not observed. Cursor metadata never arrived (no cursor meta block on any buffer), so absolute-pointer behaviour is unconfirmed.
+- **Locked screen: blocked.** After `loginctl lock-session` the open session was closed in 3.3 s and a new one failed with `Session creation inhibited`; it worked again after `loginctl unlock-session`. This matches Mutter/GNOME Shell source (`unlock-dialog` mode does not allow screencast, so Shell calls `inhibit_remote_access()`).
+- `SetKeymap` is untrusted: the run that called it coincided with a GNOME Shell SIGSEGV in the capture path (llvmpipe texture allocation); three later runs without it did not crash. `KeymapCapabilities` reads back empty on this Mutter. The keysym or matching-layout fallback is needed.
+- Not tested: dmabuf, real GPUs (AMD/Intel/NVIDIA), an idle-triggered lock, the login screen, reading what a desktop app copied.
+
+### Decision (2026-11-15)
+
+This fork **replaces Sunshine/Moonlight**. The cost is accepted: a locked workstation cannot be reached with this backend. Sunshine stays in vexos until M4 passes, as planned.
