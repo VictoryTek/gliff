@@ -1,0 +1,16 @@
+[package]
+name = "gliff-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# The capture and input vocabulary (frames, events, commands) is shared by
+# every backend; only the way it is produced differs.
+hypr-capture.workspace = true
+hypr-input.workspace = true

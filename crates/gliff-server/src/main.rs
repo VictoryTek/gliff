@@ -4,7 +4,9 @@
 
 #![forbid(unsafe_code)]
 
+mod backend;
 mod clipboard;
+mod hypr_backend;
 mod notify;
 mod rate;
 mod session;

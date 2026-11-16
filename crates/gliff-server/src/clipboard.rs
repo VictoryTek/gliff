@@ -21,6 +21,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::sync::OnceCell;
 
+use gliff_backend::{ClipboardControl, ClipboardEvent};
 use gliff_proto::clipboard::{
     file_list_body, forwardable_mimes, is_file_mime, local_mimes_for_offer, parse_uri_list,
     resolve_mime, MAX_ITEM,
@@ -31,7 +32,6 @@ use gliff_transport::clipboard::files::{
 };
 use gliff_transport::clipboard::progress::{describe_files, describe_mime, Jobs};
 use gliff_transport::clipboard::{Event, ReadSource, Transfers, WriteSink};
-use hypr_input::{Clipboard, ClipboardEvent};
 
 /// Longest `text/uri-list` we read to build an offer.
 const URI_LIST_MAX: usize = 1024 * 1024;
@@ -58,7 +58,7 @@ struct RemoteOffer {
 pub struct Bridge {
     transfers: Transfers,
     jobs: Jobs,
-    compositor: Option<Clipboard>,
+    compositor: Option<Box<dyn ClipboardControl>>,
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
     /// Bumped per selection so a slow offer build for a stale one is dropped.
@@ -66,7 +66,11 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(transfers: Transfers, jobs: Jobs, compositor: Option<Clipboard>) -> Self {
+    pub fn new(
+        transfers: Transfers,
+        jobs: Jobs,
+        compositor: Option<Box<dyn ClipboardControl>>,
+    ) -> Self {
         Self {
             transfers,
             jobs,

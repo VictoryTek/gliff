@@ -192,3 +192,37 @@ Gate per step: a probe command (extend `gliff-probe`) proves the step on a real 
 ### Decision (2026-11-15)
 
 This fork **replaces Sunshine/Moonlight**. The cost is accepted: a locked workstation cannot be reached with this backend. Sunshine stays in vexos until M4 passes, as planned.
+
+### M2 result: the seam (2026-11-15)
+
+- New crate `gliff-backend`: the `Backend` trait (`list_outputs`, `create_virtual_output`, `set_mode`, `remove_output`, `align_mode`, `keep_awake`, `start_capture`, `start_input`, `start_clipboard`), the handle traits (`CaptureControl`, `InputControl`, `ClipboardControl`) and neutral `OutputInfo` / `CreateError`. Frames, input commands and clipboard events keep the `hypr-capture` / `hypr-input` types, so a GNOME backend produces the same `CapturedFrame`.
+- `gliff-server` changes: `session.rs` and `clipboard.rs` call the trait instead of `hypr_ipc` / `Capturer` / `Input` / `Clipboard`; `main.rs` only gains two `mod` lines. The Hyprland calls moved unchanged into `src/hypr_backend.rs`; `src/backend.rs::discover` picks the backend (Hyprland only for now).
+- Rulings: (1) `keep_awake` returns the periodic check closure and `session.rs` keeps the existing `KeepAwake::poll` thread, to keep the diff small. (2) `align_mode` was added to the trait because Hyprland's scale-divisibility rule (`clean_mode`) is compositor specific. (3) `discover` is a free function in `gliff-server` because the trait crate cannot depend on its implementations. (4) `Config` keeps its `Hyprland`-typed `target` and `render_node` for now, so `main.rs` is untouched.
+- Verification: `scripts/check.sh` (rustfmt, clippy `-D warnings`, 276 unit tests) passes. `scripts/e2e.sh` was NOT run (no Hyprland session available); by decision it is assumed to still pass.
+
+### Decisions (2026-11-15)
+
+- No issue is opened upstream; the fork proceeds on its own (MIT licence).
+- GNOME support lives on `main` behind the runtime-selected backend; there is no GNOME branch. The `upstream` branch is only an optional mirror of omacom's `main`.
+
+## Rule: keep upstream files in sync-able shape
+
+This fork merges omacom's `main` regularly, so our features must not make that merge harder.
+
+- New code goes in new crates and new files (`gliff-backend`, `gnome-*`, `hypr_backend.rs`, `backend.rs`, `nix/`, `flake.nix`, `docs/gnome-backend.md`).
+- An upstream-owned file is edited only when there is no other way, with the smallest change that works (one line where possible). No reformatting, renaming or tidying of upstream code. Upstream docs (`README.md`, `docs/architecture.md`, ...) are not edited; GNOME documentation goes in `docs/gnome-backend.md`.
+- Every upstream-owned file we edit is listed here with the reason. A new entry needs a reason too.
+- `Cargo.lock` is generated: after a merge, regenerate it instead of hand-merging.
+- To see the footprint at any time: `git diff --name-status upstream/main` (`M` rows are upstream files we changed).
+
+Upstream files edited so far:
+
+| File | Change | Why |
+|---|---|---|
+| `crates/gliff-server/src/session.rs` | calls go through the `Backend` trait | the seam (M2); the one large edit |
+| `crates/gliff-server/src/clipboard.rs` | `Box<dyn ClipboardControl>` instead of `Clipboard` | the seam (M2) |
+| `crates/gliff-server/src/main.rs` | two `mod` lines | register our new modules |
+| `Cargo.toml`, `crates/gliff-server/Cargo.toml` | member, dependency lines | register our new crate |
+| `Cargo.lock` | generated | follows the lines above |
+
+Still to come, and the places most likely to need an upstream edit: the viewer (`crates/gliff/src/keymap.rs`, `net.rs`, `paintable.rs`, M4) and `gliff-probe` (M3 probes go in a new binary or module first).
