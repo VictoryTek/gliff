@@ -2,6 +2,24 @@
 
 Tier 3 (new dependency, new repo, many files, replaces a remote-access feature). Nothing is built until you approve this plan.
 
+## Status
+
+Update this table when a step finishes. A fresh session starts here, then reads the "Decisions and results log" at the end and `git log`.
+
+| Step | State | Notes |
+|---|---|---|
+| Fork, flake, branch model | done | Fork is `VictoryTek/gliff`. The `upstream` mirror branch is optional and not published; GNOME work lives on `main`. |
+| M0 feasibility spike | done, gate passed with a limit | Works unlocked; a locked screen blocks it. Sunshine is replaced anyway (decision). Spike code is in `~/Projects/gliff-spike` on one machine only, not in this repo; its findings are in the log below. |
+| M1 Nix packaging | done, one gate item waived | Package builds, 275 tests pass. Hyprland-to-Hyprland run not done (no Hyprland host); assumed to work. |
+| M2 the seam | done, one gate item waived | `scripts/check.sh` passes (276 tests). `scripts/e2e.sh` not run (no Hyprland session); assumed to pass. |
+| M3 GNOME backend | **next**, not started | Order: `gnome-ipc`, `gnome-capture`, `gnome-input`, `gnome-clipboard`, virtual output and keep-awake. Cursor metadata and `SetKeymap` are unresolved (see M0 result). |
+| M4 viewer and hardware matrix | not started | |
+| M5 vexos integration | not started | Done in a session in the vexos repo, after M4 passes. Sunshine stays until then. |
+| M6 sync automation | not started | The weekly workflow (the plan's `upstream-sync.yml`) does not exist yet; sync is manual until then. |
+| M7 Windows viewer | not started, optional | |
+
+To check the repo: `nix develop -i -k HOME -k TERM path:. -c scripts/check.sh` (the plain `nix develop` fails to link here).
+
 ## Context
 
 You want one remote-desktop tool that needs only SSH. Sunshine/Moonlight needs a PIN pairing on every workstation. Gliff (omacom/gliff, MIT, Rust, v0.4.3) is the tool you like, but its server only works on Hyprland. You want to:
@@ -192,6 +210,13 @@ Gate per step: a probe command (extend `gliff-probe`) proves the step on a real 
 ### Decision (2026-11-15)
 
 This fork **replaces Sunshine/Moonlight**. The cost is accepted: a locked workstation cannot be reached with this backend. Sunshine stays in vexos until M4 passes, as planned.
+
+### M1 result: Nix packaging (2026-11-15)
+
+- `flake.nix` + `nix/package.nix` + `nix/module.nix` build the unmodified upstream workspace (`packages.default`) and provide `nixosModules.default` (`programs.gliff.enable`: installs the package, enables `hardware.graphics`). The Nix build runs the unit tests (275 at the time).
+- Fixed along the way: `dbus` was missing from the build inputs; the Vulkan loader is linked into the real executables because it is opened with `dlopen` and the RPATH shrink would drop it.
+- Not done: the Hyprland-to-Hyprland run with `gliff-probe all` (no Hyprland host). Waived by decision; assumed to work.
+- Nix ignores untracked files in a git repo, so before a commit use `nix build path:.#default`.
 
 ### M2 result: the seam (2026-11-15)
 
