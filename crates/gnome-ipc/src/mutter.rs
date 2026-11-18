@@ -197,8 +197,8 @@ impl Drop for Closing {
 /// starting one starts both.
 pub struct Session {
     conn: Closing,
-    rd: Proxy<'static>,
-    sc: Proxy<'static>,
+    pub(crate) rd: Proxy<'static>,
+    sc: Option<Proxy<'static>>,
     id: String,
     closed: Arc<AtomicBool>,
     stopped: bool,
@@ -207,6 +207,17 @@ pub struct Session {
 impl Session {
     /// Create the pair of sessions on a connection of its own.
     pub fn create(address: &str) -> Result<Session> {
+        Self::create_with(address, true)
+    }
+
+    /// Create a RemoteDesktop session with no ScreenCast session: nothing to
+    /// record, but input and the clipboard work. Use it for the clipboard, so
+    /// that it lives and ends on its own.
+    pub fn create_remote_only(address: &str) -> Result<Session> {
+        Self::create_with(address, false)
+    }
+
+    fn create_with(address: &str, screencast: bool) -> Result<Session> {
         let conn = Closing(connect(address)?);
         let rd_root = proxy(&conn, RD, RD_PATH, RD)?;
         let rd_path: OwnedObjectPath = rd_root
@@ -224,13 +235,17 @@ impl Session {
             }
         });
 
-        let sc_root = proxy(&conn, SC, SC_PATH, SC)?;
-        let mut props: HashMap<&str, Value> = HashMap::new();
-        props.insert("remote-desktop-session-id", Value::from(id.as_str()));
-        let sc_path: OwnedObjectPath = sc_root
-            .call("CreateSession", &(props,))
-            .context("ScreenCast.CreateSession")?;
-        let sc = proxy(&conn, SC, sc_path.into_inner(), SC_SESSION)?;
+        let sc = if screencast {
+            let sc_root = proxy(&conn, SC, SC_PATH, SC)?;
+            let mut props: HashMap<&str, Value> = HashMap::new();
+            props.insert("remote-desktop-session-id", Value::from(id.as_str()));
+            let sc_path: OwnedObjectPath = sc_root
+                .call("CreateSession", &(props,))
+                .context("ScreenCast.CreateSession")?;
+            Some(proxy(&conn, SC, sc_path.into_inner(), SC_SESSION)?)
+        } else {
+            None
+        };
         Ok(Session {
             conn,
             rd,
@@ -262,13 +277,15 @@ impl Session {
     pub fn record(&self, source: &StreamSource, cursor: CursorMode) -> Result<Stream> {
         let mut props: HashMap<&str, Value> = HashMap::new();
         props.insert("cursor-mode", Value::from(cursor as u32));
+        let sc = self
+            .sc
+            .as_ref()
+            .context("this session was created without ScreenCast")?;
         let path: OwnedObjectPath = match source {
-            StreamSource::Monitor(connector) => self
-                .sc
+            StreamSource::Monitor(connector) => sc
                 .call("RecordMonitor", &(connector.as_str(), props))
                 .with_context(|| format!("ScreenCast.RecordMonitor({connector})"))?,
-            StreamSource::Virtual => self
-                .sc
+            StreamSource::Virtual => sc
                 .call("RecordVirtual", &(props,))
                 .context("ScreenCast.RecordVirtual")?,
         };

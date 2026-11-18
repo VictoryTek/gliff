@@ -6,10 +6,12 @@
 //! compatibility between releases, so every call's error text is kept
 //! verbatim: it is the evidence when a GNOME update breaks something.
 
+pub mod clipboard;
 pub mod discover;
 pub mod input;
 pub mod mutter;
 
+pub use clipboard::{ClipboardPort, ClipboardSignal};
 pub use discover::{find as find_session, GraphicalSession};
 pub use input::InputPort;
 pub use mutter::{connect, monitors, versions, CursorMode, Monitor, Session, Stream, StreamSource};

@@ -67,3 +67,19 @@ gliff-gnome-input-probe caps    # taps Caps Lock twice and checks it toggled and
 Keys are sent as keycodes read with the server's keyboard layout, so a viewer
 with a different layout types the wrong characters until keymap forwarding
 exists; a keymap sent by the viewer is refused with an error.
+
+## `gnome-clipboard`
+
+`crates/gnome-clipboard` bridges gliff's clipboard to the desktop through a
+RemoteDesktop session of its own. Check it with the probe (`roundtrip`
+replaces the desktop's clipboard while it runs):
+
+```
+gliff-gnome-clipboard-probe roundtrip      # both directions, a big item, echo and withdraw rules
+gliff-gnome-clipboard-probe serve "text" 20   # offer text, report each paste (paste into a test window)
+gliff-gnome-clipboard-probe watch 20          # report and read what the desktop copies
+```
+
+When an owner goes away or withdraws, Mutter hands the selection back to
+whatever held it before, so a withdraw is reported as an empty selection and the
+older one then reappears.

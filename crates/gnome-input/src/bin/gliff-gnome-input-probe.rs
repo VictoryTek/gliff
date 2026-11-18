@@ -8,6 +8,7 @@
 //!   click[:left|right|middle]
 //!   type:TEXT             letters, digits, space (US layout), sent as keys
 //!   wheel:N               N wheel steps down (negative: up)
+//!   paste | copy          press Ctrl+Shift+V / Ctrl+Shift+C (a terminal's paste and copy)
 //!   caps                  tap Caps Lock twice and check it toggled and returned
 //!   wait:MS
 //!
@@ -27,6 +28,9 @@ const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_CAPSLOCK: u32 = 58;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_V: u32 = 47;
+const KEY_C: u32 = 46;
 
 fn ok(name: &str, detail: impl std::fmt::Display) {
     println!("[ OK ] {name}: {detail}");
@@ -229,6 +233,22 @@ fn run(actions: &[String]) -> bool {
                 ok("wheel", format!("{steps} steps"));
                 Ok(())
             }
+            "paste" | "copy" => {
+                let letter = if name == "paste" { KEY_V } else { KEY_C };
+                let chord = || -> anyhow::Result<()> {
+                    key(&input, KEY_LEFTCTRL, true)?;
+                    key(&input, KEY_LEFTSHIFT, true)?;
+                    tap(&input, letter)?;
+                    key(&input, KEY_LEFTSHIFT, false)?;
+                    key(&input, KEY_LEFTCTRL, false)
+                };
+                chord().map_err(|e| format!("{e:#}"))?;
+                ok(
+                    name,
+                    format!("Ctrl+Shift+{}", if name == "paste" { 'V' } else { 'C' }),
+                );
+                Ok(())
+            }
             "caps" => {
                 let before = port.lock_state().map_err(|e| format!("{e:#}"))?.0;
                 tap(&input, KEY_CAPSLOCK).map_err(|e| format!("{e:#}"))?;
@@ -269,7 +289,7 @@ fn run(actions: &[String]) -> bool {
 fn main() {
     let actions: Vec<String> = std::env::args().skip(1).collect();
     if actions.is_empty() {
-        eprintln!("usage: gliff-gnome-input-probe ACTION...  (move:X,Y click[:left|right|middle] type:TEXT wheel:N caps wait:MS)");
+        eprintln!("usage: gliff-gnome-input-probe ACTION...  (move:X,Y click[:left|right|middle] type:TEXT wheel:N paste copy caps wait:MS)");
         std::process::exit(2);
     }
     std::process::exit(if run(&actions) { 0 } else { 1 });

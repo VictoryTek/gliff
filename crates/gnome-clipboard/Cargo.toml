@@ -1,0 +1,18 @@
+[package]
+name = "gnome-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bridge gliff's clipboard to a GNOME session through Mutter"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gnome-ipc = { path = "../gnome-ipc" }
+hypr-input.workspace = true
+nix.workspace = true
+rustix.workspace = true
+tracing.workspace = true

@@ -1114,6 +1114,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnome-clipboard"
+version = "0.4.3"
+dependencies = [
+ "anyhow",
+ "gnome-ipc",
+ "hypr-input",
+ "nix",
+ "rustix 1.1.4",
+ "tracing",
+]
+
+[[package]]
 name = "gnome-input"
 version = "0.4.3"
 dependencies = [
