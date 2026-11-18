@@ -241,6 +241,13 @@ impl Session {
         })
     }
 
+    /// The session's input calls. Usable once the session has started.
+    pub fn input(&self) -> crate::InputPort {
+        crate::InputPort {
+            rd: self.rd.clone(),
+        }
+    }
+
     /// Mutter's session id (what the linked ScreenCast session names).
     pub fn id(&self) -> &str {
         &self.id

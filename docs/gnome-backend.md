@@ -51,3 +51,19 @@ gliff-gnome-capture-probe --cursor embedded   # cursor painted into the frames
 The probe reports the frame size, whether the pixels are real, the frame rate,
 whether a recapture works and what the cursor did; `--png` saves the first
 frame so it can be looked at.
+
+## `gnome-input`
+
+`crates/gnome-input` sends gliff's key, pointer, button and wheel commands to
+the session. Check it with the probe; aim clicks and keys at a test window,
+never at someone's work:
+
+```
+gliff-gnome-input-probe move:960,540 click:left type:"Hello 42" wheel:3
+gliff-gnome-input-probe caps    # taps Caps Lock twice and checks it toggled and returned
+```
+
+`move` is checked by reading the pointer back through the capture stream.
+Keys are sent as keycodes read with the server's keyboard layout, so a viewer
+with a different layout types the wrong characters until keymap forwarding
+exists; a keymap sent by the viewer is refused with an error.

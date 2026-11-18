@@ -1114,6 +1114,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnome-input"
+version = "0.4.3"
+dependencies = [
+ "anyhow",
+ "gnome-capture",
+ "gnome-ipc",
+ "hypr-input",
+]
+
+[[package]]
 name = "gnome-ipc"
 version = "0.4.3"
 dependencies = [

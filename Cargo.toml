@@ -6,6 +6,7 @@ members = [
     "crates/gliff-backend",
     "crates/gnome-ipc",
     "crates/gnome-capture",
+    "crates/gnome-input",
     "crates/hypr-ipc",
     "crates/hypr-wl",
     "crates/hypr-capture",

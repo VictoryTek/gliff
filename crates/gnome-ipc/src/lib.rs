@@ -7,7 +7,9 @@
 //! verbatim: it is the evidence when a GNOME update breaks something.
 
 pub mod discover;
+pub mod input;
 pub mod mutter;
 
 pub use discover::{find as find_session, GraphicalSession};
+pub use input::InputPort;
 pub use mutter::{connect, monitors, versions, CursorMode, Monitor, Session, Stream, StreamSource};
