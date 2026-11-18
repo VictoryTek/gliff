@@ -12,7 +12,7 @@ Update this table when a step finishes. A fresh session starts here, then reads 
 | M0 feasibility spike | done, gate passed with a limit | Works unlocked; a locked screen blocks it. Sunshine is replaced anyway (decision). Spike code is in `~/Projects/gliff-spike` on one machine only, not in this repo; its findings are in the log below. |
 | M1 Nix packaging | done, one gate item waived | Package builds, 275 tests pass. Hyprland-to-Hyprland run not done (no Hyprland host); assumed to work. |
 | M2 the seam | done, one gate item waived | `scripts/check.sh` passes (276 tests). `scripts/e2e.sh` not run (no Hyprland session); assumed to pass. |
-| M3 GNOME backend | **next**, not started | Order: `gnome-ipc`, `gnome-capture`, `gnome-input`, `gnome-clipboard`, virtual output and keep-awake. Cursor metadata and `SetKeymap` are unresolved (see M0 result). |
+| M3 GNOME backend | **in progress**: step 1 `gnome-ipc` done, step 2 `gnome-capture` next | Steps: 1 `gnome-ipc` (done), 2 `gnome-capture`, 3 `gnome-input`, 4 `gnome-clipboard`, 5 virtual output and keep-awake. Cursor metadata and `SetKeymap` are unresolved (see M0 result). Nothing is wired into `gliff-server` yet; that happens when a step needs the end-to-end gate. |
 | M4 viewer and hardware matrix | not started | |
 | M5 vexos integration | not started | Done in a session in the vexos repo, after M4 passes. Sunshine stays until then. |
 | M6 sync automation | not started | The weekly workflow (the plan's `upstream-sync.yml`) does not exist yet; sync is manual until then. |
@@ -225,6 +225,13 @@ This fork **replaces Sunshine/Moonlight**. The cost is accepted: a locked workst
 - Rulings: (1) `keep_awake` returns the periodic check closure and `session.rs` keeps the existing `KeepAwake::poll` thread, to keep the diff small. (2) `align_mode` was added to the trait because Hyprland's scale-divisibility rule (`clean_mode`) is compositor specific. (3) `discover` is a free function in `gliff-server` because the trait crate cannot depend on its implementations. (4) `Config` keeps its `Hyprland`-typed `target` and `render_node` for now, so `main.rs` is untouched.
 - Verification: `scripts/check.sh` (rustfmt, clippy `-D warnings`, 276 unit tests) passes. `scripts/e2e.sh` was NOT run (no Hyprland session available); by decision it is assumed to still pass.
 
+### M3 step 1 result: `gnome-ipc` (2026-11-17)
+
+- New crate `crates/gnome-ipc` (zbus blocking API, no async runtime needed). `discover` finds the user's active local graphical session from an ssh login with `loginctl` (skips our own remote login and greeter sessions) and builds the session bus address. `mutter` connects to the bus, reads both Mutter `Version` properties, lists monitors (`DisplayConfig.GetCurrentState`) and wraps a linked RemoteDesktop + ScreenCast `Session` (`record` a monitor or a virtual monitor, `start`, wait for the PipeWire node, `stop`). Each `Session` has its own bus connection and closes it on drop, so Mutter ends the session even when a listener thread is still blocked. Probe binary: `gliff-gnome-probe [--virtual]`.
+- Verified on the GNOME 50.6 VM over ssh (`nimda@192.168.100.71`), with no `DBUS_SESSION_BUS_ADDRESS` or `XDG_RUNTIME_DIR` set: session found, Mutter RemoteDesktop v1 and ScreenCast v4, monitor and virtual capture both reach a PipeWire node, repeated runs leave no sessions behind, a bad bus address fails with a clear message. A temporary check (deleted) showed that a failed `RecordMonitor`, an unstarted session and a fresh session all release their listener threads once dropped. `scripts/check.sh` passes; the crate has 8 unit tests.
+- Not verified: locked screen (known limit), a failed `Start`, more than one monitor, anything about frames (step 2).
+- Review: two rounds with Sol (`gpt-6.1-sol`, default effort). Round 1: one `should` (listener threads kept the connection alive on failed create or start, and Mutter rejects `Stop` before `Start`); fixed with a connection-closing guard. Round 2: approved, nothing open. Sol could not run cargo in its sandbox, so every test result above is from this machine.
+
 ### Decisions (2026-11-15)
 
 - No issue is opened upstream; the fork proceeds on its own (MIT licence).
@@ -247,7 +254,7 @@ Upstream files edited so far:
 | `crates/gliff-server/src/session.rs` | calls go through the `Backend` trait | the seam (M2); the one large edit |
 | `crates/gliff-server/src/clipboard.rs` | `Box<dyn ClipboardControl>` instead of `Clipboard` | the seam (M2) |
 | `crates/gliff-server/src/main.rs` | two `mod` lines | register our new modules |
-| `Cargo.toml`, `crates/gliff-server/Cargo.toml` | member, dependency lines | register our new crate |
+| `Cargo.toml`, `crates/gliff-server/Cargo.toml` | member, dependency lines (one member line per new crate: `gliff-backend`, `gnome-ipc`) | register our new crates |
 | `Cargo.lock` | generated | follows the lines above |
 
 Still to come, and the places most likely to need an upstream edit: the viewer (`crates/gliff/src/keymap.rs`, `net.rs`, `paintable.rs`, M4) and `gliff-probe` (M3 probes go in a new binary or module first).
