@@ -44,7 +44,7 @@ pub fn connect(address: &str) -> Result<Connection> {
         .with_context(|| format!("connect to the session bus at {address}"))
 }
 
-fn proxy<'a>(
+pub(crate) fn proxy<'a>(
     conn: &Connection,
     dest: &'static str,
     path: impl TryInto<zbus::zvariant::ObjectPath<'a>, Error = impl Into<zbus::Error>>,
@@ -178,7 +178,13 @@ impl Stream {
 /// Closes the bus connection when dropped. The signal listener threads hold
 /// clones of the connection, so merely dropping ours would leave the
 /// session open in Mutter and the listeners blocked.
-struct Closing(Connection);
+pub(crate) struct Closing(Connection);
+
+impl Closing {
+    pub(crate) fn new(conn: Connection) -> Self {
+        Closing(conn)
+    }
+}
 
 impl std::ops::Deref for Closing {
     type Target = Connection;
@@ -261,6 +267,11 @@ impl Session {
         crate::InputPort {
             rd: self.rd.clone(),
         }
+    }
+
+    /// Every enabled monitor, on this session's own connection.
+    pub fn monitors(&self) -> Result<Vec<Monitor>> {
+        monitors(&self.conn)
     }
 
     /// Mutter's session id (what the linked ScreenCast session names).

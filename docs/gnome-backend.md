@@ -83,3 +83,24 @@ gliff-gnome-clipboard-probe watch 20          # report and read what the desktop
 When an owner goes away or withdraws, Mutter hands the selection back to
 whatever held it before, so a withdraw is reported as an empty selection and the
 older one then reappears.
+
+## Virtual output and keep-awake
+
+`gnome_capture::VirtualOutput` creates a private screen and removes it when it
+is dropped; `gnome_ipc::power` wakes a blanked screen and keeps the desktop
+from going idle. Check them with the probe:
+
+```
+gliff-gnome-output-probe              # create, resize, two at once, remove, with the screen blanked first
+gliff-gnome-output-probe idle 50      # control: with no output, report the screen state every 10 s
+gliff-gnome-output-probe hold 80      # with an output, the same
+```
+
+To see keep-awake working, lower the idle delay for the test and put it back
+(`gsettings set org.gnome.desktop.session idle-delay 30`, then `300` or your
+own value): `idle` should show the screen blank, `hold` should not. The probe
+blanks the screen on purpose to test the wake, so run it on a test machine.
+
+The monitor exists only while something reads its stream, and Mutter sizes it
+from the format the reader asks for, so a resize is a new format request. The
+virtual monitor is always scale 1.

@@ -8,6 +8,7 @@
 //! They are CPU-readable only; zero-copy dmabuf capture is a later step.
 
 mod cursor;
+mod output;
 mod pacer;
 mod pw;
 
@@ -19,6 +20,7 @@ use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 pub use hypr_capture::{CaptureEvent, CapturedFrame, EventSink, SizeLimit};
+pub use output::VirtualOutput;
 
 /// How to capture one stream.
 #[derive(Debug, Clone)]
@@ -34,6 +36,10 @@ pub struct Options {
     pub buffers: usize,
     /// End the capture with an error when the stream grows past this.
     pub max_size: Option<SizeLimit>,
+    /// Ask for this size from the start. Only a virtual monitor follows it.
+    /// Without it the stream takes the producer's own size (1920x1080 for a
+    /// virtual monitor).
+    pub size: Option<(u32, u32)>,
 }
 
 impl Options {
@@ -44,6 +50,7 @@ impl Options {
             name: name.into(),
             buffers: 3,
             max_size: None,
+            size: None,
         }
     }
 }
@@ -72,6 +79,7 @@ pub(crate) enum Cmd {
     Request,
     Recapture,
     Release { index: usize, generation: u64 },
+    Resize { width: u32, height: u32 },
     Stop,
 }
 
@@ -120,6 +128,13 @@ impl Capturer {
     /// Send a full frame now: the newest unsent one, else the last one again.
     pub fn recapture(&self) -> Result<()> {
         self.send(Cmd::Recapture)
+    }
+
+    /// Ask the stream for a new size. Only a virtual monitor follows (it is
+    /// resized to match); a real monitor keeps its mode. The consumer learns
+    /// the result as a new [`CaptureEvent::Ready`], if it comes.
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
+        self.send(Cmd::Resize { width, height })
     }
 
     pub fn stats(&self) -> &Stats {

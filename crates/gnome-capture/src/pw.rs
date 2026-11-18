@@ -52,7 +52,10 @@ fn serialize(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
-fn enum_format() -> Vec<u8> {
+/// The format we accept. With `fixed`, the size is that one size, which asks
+/// a virtual monitor to take it; without, any size, which lets the producer
+/// choose.
+fn enum_format(fixed: Option<(u32, u32)>) -> Vec<u8> {
     use spa::param::format::{FormatProperties as F, MediaSubtype, MediaType};
     use spa::pod::ChoiceValue;
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
@@ -87,23 +90,26 @@ fn enum_format() -> Vec<u8> {
             ),
             Property::new(
                 F::VideoSize.as_raw(),
-                Value::Choice(ChoiceValue::Rectangle(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: Rectangle {
-                            width: 1920,
-                            height: 1080,
+                match fixed {
+                    Some((width, height)) => Value::Rectangle(Rectangle { width, height }),
+                    None => Value::Choice(ChoiceValue::Rectangle(Choice(
+                        ChoiceFlags::empty(),
+                        ChoiceEnum::Range {
+                            default: Rectangle {
+                                width: 1920,
+                                height: 1080,
+                            },
+                            min: Rectangle {
+                                width: 1,
+                                height: 1,
+                            },
+                            max: Rectangle {
+                                width: 16384,
+                                height: 16384,
+                            },
                         },
-                        min: Rectangle {
-                            width: 1,
-                            height: 1,
-                        },
-                        max: Rectangle {
-                            width: 16384,
-                            height: 16384,
-                        },
-                    },
-                ))),
+                    ))),
+                },
             ),
             Property::new(
                 F::VideoFramerate.as_raw(),
@@ -280,6 +286,8 @@ impl State {
                 }
             }
             Cmd::Stop => self.mainloop.quit(),
+            // Handled where the stream is; see `run_inner`.
+            Cmd::Resize { .. } => {}
         }
     }
 
@@ -406,8 +414,8 @@ fn run_inner(
     let core = context
         .connect_fd_rc(OwnedFd::from(sock), None)
         .map_err(|e| err("PipeWire core")(&e))?;
-    let stream = pw::stream::StreamBox::new(
-        &core,
+    let stream = pw::stream::StreamRc::new(
+        core.clone(),
         "gliff",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
@@ -418,6 +426,7 @@ fn run_inner(
     .map_err(|e| err("stream")(&e))?;
 
     let node = options.node;
+    let node_size = options.size;
     let release_tx = command_tx;
     let state = Rc::new(RefCell::new(State {
         sink,
@@ -440,7 +449,19 @@ fn run_inner(
 
     let _commands = {
         let st = state.clone();
-        commands.attach(mainloop.loop_(), move |cmd| st.borrow_mut().command(cmd))
+        let stream = stream.clone();
+        commands.attach(mainloop.loop_(), move |cmd| match cmd {
+            // Asking for a new fixed size makes the producer renegotiate, and
+            // `param_changed` below then builds the new ring.
+            Cmd::Resize { width, height } => {
+                let format = enum_format(Some((width, height)));
+                let mut params = [Pod::from_bytes(&format).expect("format pod")];
+                if let Err(e) = stream.update_params(&mut params) {
+                    st.borrow_mut().fail(format!("resize: {e}"));
+                }
+            }
+            cmd => st.borrow_mut().command(cmd),
+        })
     };
 
     let _listener = stream
@@ -508,7 +529,7 @@ fn run_inner(
         .register()
         .map_err(|e| err("stream listener")(&e))?;
 
-    let format = enum_format();
+    let format = enum_format(node_size);
     let mut params = [Pod::from_bytes(&format).expect("format pod")];
     stream
         .connect(
@@ -523,4 +544,37 @@ fn run_inner(
     mainloop.run();
     state.borrow_mut().emit(CaptureEvent::Stopped);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spa::pod::deserialize::PodDeserializer;
+    use spa::utils::Rectangle;
+
+    /// The `VideoSize` property of a serialized format.
+    fn video_size(bytes: &[u8]) -> Value {
+        let (_, value) = PodDeserializer::deserialize_from::<Value>(bytes).expect("parse");
+        let Value::Object(object) = value else {
+            panic!("not an object")
+        };
+        object
+            .properties
+            .into_iter()
+            .find(|p| p.key == spa::param::format::FormatProperties::VideoSize.as_raw())
+            .expect("a size")
+            .value
+    }
+
+    #[test]
+    fn a_fixed_format_names_one_size_and_the_default_takes_any() {
+        assert!(matches!(
+            video_size(&enum_format(Some((1280, 720)))),
+            Value::Rectangle(Rectangle {
+                width: 1280,
+                height: 720
+            })
+        ));
+        assert!(matches!(video_size(&enum_format(None)), Value::Choice(_)));
+    }
 }

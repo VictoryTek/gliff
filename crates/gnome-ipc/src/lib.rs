@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod discover;
 pub mod input;
 pub mod mutter;
+pub mod power;
 
 pub use clipboard::{ClipboardPort, ClipboardSignal};
 pub use discover::{find as find_session, GraphicalSession};
