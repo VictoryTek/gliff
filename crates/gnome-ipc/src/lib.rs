@@ -10,4 +10,4 @@ pub mod discover;
 pub mod mutter;
 
 pub use discover::{find as find_session, GraphicalSession};
-pub use mutter::{connect, monitors, versions, Monitor, Session, Stream, StreamSource};
+pub use mutter::{connect, monitors, versions, CursorMode, Monitor, Session, Stream, StreamSource};

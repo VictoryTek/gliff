@@ -25,9 +25,16 @@ const SC_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
 const DC: &str = "org.gnome.Mutter.DisplayConfig";
 const DC_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 
-/// `cursor-mode` 2: the cursor is not painted into the frames; its position
-/// and image travel as stream metadata.
-const CURSOR_METADATA: u32 = 2;
+/// How a stream carries the mouse cursor (Mutter's `cursor-mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMode {
+    /// Not in the stream at all.
+    Hidden = 0,
+    /// Painted into the frames.
+    Embedded = 1,
+    /// Not painted; position and image travel as stream metadata.
+    Metadata = 2,
+}
 
 /// Connect to the session bus at `address`.
 pub fn connect(address: &str) -> Result<Connection> {
@@ -245,9 +252,9 @@ impl Session {
     }
 
     /// Record a source. Call before [`Session::start`].
-    pub fn record(&self, source: &StreamSource) -> Result<Stream> {
+    pub fn record(&self, source: &StreamSource, cursor: CursorMode) -> Result<Stream> {
         let mut props: HashMap<&str, Value> = HashMap::new();
-        props.insert("cursor-mode", Value::from(CURSOR_METADATA));
+        props.insert("cursor-mode", Value::from(cursor as u32));
         let path: OwnedObjectPath = match source {
             StreamSource::Monitor(connector) => self
                 .sc

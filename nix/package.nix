@@ -1,4 +1,5 @@
-# Builds the unmodified upstream workspace (gliff, gliff-server, gliff-probe).
+# Builds the workspace: upstream's gliff, gliff-server and gliff-probe plus the
+# GNOME crates (pipewire and the bindgen hook are for gnome-capture).
 # Dependencies follow pkgbuild/PKGBUILD in this repository.
 { lib
 , rustPlatform
@@ -12,6 +13,7 @@
 , libgbm
 , libxkbcommon
 , dbus
+, pipewire
 , vulkan-loader
 , wayland
 , openssh
@@ -33,8 +35,8 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  nativeBuildInputs = [ pkg-config nasm wrapGAppsHook4 ];
-  buildInputs = [ gtk4 libadwaita libva libdrm libgbm libxkbcommon dbus vulkan-loader wayland ];
+  nativeBuildInputs = [ pkg-config nasm wrapGAppsHook4 rustPlatform.bindgenHook ];
+  buildInputs = [ gtk4 libadwaita libva libdrm libgbm libxkbcommon dbus pipewire vulkan-loader wayland ];
 
   # Unit tests only; the hardware paths are covered by scripts/e2e.sh, which
   # needs a Hyprland session and a GPU.

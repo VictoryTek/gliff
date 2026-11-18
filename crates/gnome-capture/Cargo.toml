@@ -1,0 +1,19 @@
+[package]
+name = "gnome-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Capture a Mutter ScreenCast stream from PipeWire as gliff frames"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+drm-fourcc.workspace = true
+gnome-ipc = { path = "../gnome-ipc" }
+hypr-capture.workspace = true
+pipewire = "0.10"
+png.workspace = true
+rustix.workspace = true

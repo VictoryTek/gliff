@@ -12,7 +12,7 @@ Update this table when a step finishes. A fresh session starts here, then reads 
 | M0 feasibility spike | done, gate passed with a limit | Works unlocked; a locked screen blocks it. Sunshine is replaced anyway (decision). Spike code is in `~/Projects/gliff-spike` on one machine only, not in this repo; its findings are in the log below. |
 | M1 Nix packaging | done, one gate item waived | Package builds, 275 tests pass. Hyprland-to-Hyprland run not done (no Hyprland host); assumed to work. |
 | M2 the seam | done, one gate item waived | `scripts/check.sh` passes (276 tests). `scripts/e2e.sh` not run (no Hyprland session); assumed to pass. |
-| M3 GNOME backend | **in progress**: step 1 `gnome-ipc` done, step 2 `gnome-capture` next | Steps: 1 `gnome-ipc` (done), 2 `gnome-capture`, 3 `gnome-input`, 4 `gnome-clipboard`, 5 virtual output and keep-awake. Cursor metadata and `SetKeymap` are unresolved (see M0 result). Nothing is wired into `gliff-server` yet; that happens when a step needs the end-to-end gate. |
+| M3 GNOME backend | **in progress**: steps 1 `gnome-ipc` and 2a `gnome-capture` (shared memory) done; 2b dmabuf next, then 3 | Steps: 1 `gnome-ipc` (done), 2a `gnome-capture` shm frames and cursor metadata (done), 2b dmabuf with modifier negotiation (not started; needs a real GPU host, the VM renders in software), 3 `gnome-input`, 4 `gnome-clipboard`, 5 virtual output, keep-awake and wake-from-idle. `SetKeymap` is unresolved. Nothing is wired into `gliff-server` yet. |
 | M4 viewer and hardware matrix | not started | |
 | M5 vexos integration | not started | Done in a session in the vexos repo, after M4 passes. Sunshine stays until then. |
 | M6 sync automation | not started | The weekly workflow (the plan's `upstream-sync.yml`) does not exist yet; sync is manual until then. |
@@ -232,6 +232,16 @@ This fork **replaces Sunshine/Moonlight**. The cost is accepted: a locked workst
 - Not verified: locked screen (known limit), a failed `Start`, more than one monitor, anything about frames (step 2).
 - Review: two rounds with Sol (`gpt-6.1-sol`, default effort). Round 1: one `should` (listener threads kept the connection alive on failed create or start, and Mutter rejects `Stop` before `Start`); fixed with a connection-closing guard. Round 2: approved, nothing open. Sol could not run cargo in its sandbox, so every test result above is from this machine.
 
+### M3 step 2a result: `gnome-capture`, shared-memory frames (2026-11-17)
+
+- New crate `crates/gnome-capture`: `Capturer::start(Options, sink)` connects to the PipeWire node `gnome-ipc` opened (over the socket in the user's runtime dir, no environment variable needed) and emits the same `CaptureEvent`s as the Hyprland capturer. `request_frame`, `recapture` and drop match the pull model `gliff-server` uses; PipeWire pushes, so `pacer.rs` keeps the newest frame, replaces an unsent one, and can send the last frame again. Frames are copied into a ring of memfd buffers (the `buffers` the consumer may hold, plus one for re-sends), so PipeWire buffers go back at once. `cursor.rs` turns cursor metadata into `CursorShape` and `CursorPos` events. Probe: `gliff-gnome-capture-probe [--virtual] [--connector NAME] [--cursor hidden|embedded|metadata] [--png FILE] [--secs N]`.
+- Upstream edit (approved): two lines in `crates/hypr-capture/src/lib.rs` plus the new file `external.rs`; see the footprint table. `nix/package.nix` (ours) gained `pipewire` and the bindgen hook.
+- Verified on the GNOME 50.6 VM (software rendering): a monitor capture gives a correct 1920x1080 frame (the saved PNG was the real desktop, colours and orientation right), first frame in 150 to 350 ms, recapture re-sends the last frame, a virtual monitor works (the format renegotiated once, so two `Ready` events), `--cursor embedded` and `hidden` work. Cursor shape (24x24) and position now arrive in `metadata` mode. This resolves the M0 gap, whose likely cause was asking for the metadata with a fixed size instead of a size range. `scripts/check.sh` passes (12 unit tests in the crate) and `nix build path:.` passed.
+- Bug found while testing: a frame request made before the format was negotiated was lost when the ring was built; fixed with a test.
+- Not verified: dmabuf (2b), a moving or hiding cursor live (needs input, step 3; covered by unit tests and Sol's reading of Mutter's source only), a real GPU, mid-capture resize beyond the one virtual renegotiation, a slow consumer under load, PipeWire stream-error paths.
+- **Idle blanking blocks capture even with screen lock off.** On the VM (idle delay 300 s, `lock-enabled` false), after five idle minutes `org.gnome.ScreenSaver.GetActive` was true and Mutter refused sessions with "Session creation inhibited". `org.gnome.ScreenSaver.SetActive(false)` over ssh cleared it and capture worked again. With screen lock enabled this would probably show a password prompt instead (not tested). Consequence for step 5: wake the screen before creating a session and inhibit idle while one runs. A machine that is already locked still cannot be served (the M0 limit).
+- Review: two rounds with Sol (`gpt-6.1-sol`, default effort). Round 1: three `should` findings, all fixed: cursor shape was keyed on a cursor id that Mutter reuses (S1), the cursor was never hidden (S2), and a full ring dropped every newer frame while an unheld frame was pending (S3). Round 2: approved. Sol could not run cargo, so test results are from this machine.
+
 ### Decisions (2026-11-15)
 
 - No issue is opened upstream; the fork proceeds on its own (MIT licence).
@@ -254,7 +264,8 @@ Upstream files edited so far:
 | `crates/gliff-server/src/session.rs` | calls go through the `Backend` trait | the seam (M2); the one large edit |
 | `crates/gliff-server/src/clipboard.rs` | `Box<dyn ClipboardControl>` instead of `Clipboard` | the seam (M2) |
 | `crates/gliff-server/src/main.rs` | two `mod` lines | register our new modules |
-| `Cargo.toml`, `crates/gliff-server/Cargo.toml` | member, dependency lines (one member line per new crate: `gliff-backend`, `gnome-ipc`) | register our new crates |
+| `Cargo.toml`, `crates/gliff-server/Cargo.toml` | member, dependency lines (one member line per new crate: `gliff-backend`, `gnome-ipc`, `gnome-capture`) | register our new crates |
+| `crates/hypr-capture/src/lib.rs` | two added lines: `mod external;` and `pub use external::FrameSource;` (approved 2026-11-17, additive only) | `CapturedFrame` and `CaptureBuffer` have private fields, so a GNOME frame can only be built inside this crate. The constructors live in the new file `external.rs`, a child module that can see those fields; no existing line changed. |
 | `Cargo.lock` | generated | follows the lines above |
 
 Still to come, and the places most likely to need an upstream edit: the viewer (`crates/gliff/src/keymap.rs`, `net.rs`, `paintable.rs`, M4) and `gliff-probe` (M3 probes go in a new binary or module first).

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use gnome_ipc::{discover, mutter, Session, StreamSource};
+use gnome_ipc::{discover, mutter, CursorMode, Session, StreamSource};
 
 fn ok(name: &str, detail: impl std::fmt::Display) {
     println!("[ OK ] {name}: {detail}");
@@ -79,7 +79,7 @@ fn run(virtual_source: bool) -> bool {
         Err(e) => return fail("create session", format!("{e:#}")),
     };
     ok("create session", format!("linked sessions, id {}", s.id()));
-    let stream = match s.record(&source) {
+    let stream = match s.record(&source, CursorMode::Metadata) {
         Ok(st) => st,
         Err(e) => return fail("record", format!("{e:#}")),
     };

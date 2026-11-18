@@ -12,6 +12,7 @@
 
 mod cursor;
 mod device;
+mod external;
 mod thread;
 
 use std::fs::File;
@@ -24,6 +25,7 @@ use calloop::channel::Sender;
 use drm_fourcc::DrmFourcc;
 use gbm::{BufferObject, Device};
 
+pub use external::FrameSource;
 pub use hypr_wl::{OutputInfo, Target};
 
 #[derive(Debug, thiserror::Error)]
