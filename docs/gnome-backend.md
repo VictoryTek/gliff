@@ -142,3 +142,17 @@ show up when you use it:
   the remote desktop looks small. Mutter can give a virtual monitor another
   scale, but that crashed GNOME Shell on the software-rendered test VM, so it
   is off; see the "M4 part 1 result" entry in `docs/PLAN.md`.
+
+## Keeping up with upstream
+
+This fork merges omacom/gliff's `main` regularly. `scripts/sync-upstream.sh`
+makes the merge branch (`--dry-run` shows what it would do without keeping
+anything), and `.github/workflows/upstream-sync.yml` runs it every Monday,
+tests the result and opens a draft pull request, labelled "needs GNOME mirror"
+when upstream changed code that calls Hyprland directly. For it to open pull
+requests, enable "Allow GitHub Actions to create and approve pull requests"
+in the repository's Actions settings. A conflict fails the run; resolve it by
+hand with `git merge upstream/main`. When upstream changes a file under
+`.github/workflows`, the workflow's own token cannot push it: add a
+`SYNC_TOKEN` repository secret (a token with the `workflow` scope) or merge by
+hand.

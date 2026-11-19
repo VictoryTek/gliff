@@ -1,0 +1,116 @@
+# Weekly: merge omacom/gliff's main into a branch, test it, and open a pull
+# request in this fork for a person to approve. The git work is in
+# scripts/sync-upstream.sh, which can be run by hand to see what it would do.
+#
+# Needs the repository setting "Allow GitHub Actions to create and approve
+# pull requests" (Settings, Actions, General). Pull requests made with the
+# workflow token do not start other workflows, so this file runs the tests
+# itself.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  # Every gh call names this repository. Without it, gh in a fork targets the
+  # parent project, and a pull request must never be opened there.
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  merge:
+    # For the fork; upstream has nothing to sync from.
+    if: github.repository != 'omacom/gliff'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      branch: ${{ steps.sync.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # The workflow's own token cannot push a branch that changes
+          # .github/workflows. A SYNC_TOKEN secret (a token with the
+          # `workflow` scope) can.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream into a new branch
+        id: sync
+        run: |
+          set +e
+          scripts/sync-upstream.sh --summary "$RUNNER_TEMP/summary.md"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          if [ "$status" -eq 3 ]; then
+            echo "::error::Merging upstream conflicts; the job summary lists the files."
+          fi
+          exit "$status"
+
+      - name: Push the branch and open a draft pull request
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.sync.outputs.branch }}
+          NEEDS_MIRROR: ${{ steps.sync.outputs.needs_mirror }}
+          TOUCHES_WORKFLOWS: ${{ steps.sync.outputs.touches_workflows }}
+          HAVE_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          if [ "$TOUCHES_WORKFLOWS" = true ] && [ "$HAVE_TOKEN" != true ]; then
+            echo "::error::Upstream changed .github/workflows, which the workflow token cannot push. Add a SYNC_TOKEN secret (workflow scope) or run 'git merge upstream/main' by hand."
+            exit 1
+          fi
+          git push origin "$BRANCH"
+          args=(--draft --base main --head "$BRANCH"
+                --title "Merge upstream/main (${BRANCH#sync/upstream-})"
+                --body-file "$RUNNER_TEMP/summary.md")
+          if [ "$NEEDS_MIRROR" = true ]; then
+            gh label create "needs GNOME mirror" --force --color D93F0B \
+              --description "Upstream changed code the GNOME backend mirrors"
+            args+=(--label "needs GNOME mirror")
+          fi
+          gh pr create "${args[@]}"
+
+  test:
+    needs: merge
+    if: needs.merge.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.merge.outputs.branch }}
+      - uses: ./.github/actions/setup
+      - run: cargo fmt --all --check
+      - run: mbx clippy --workspace --all-targets --locked -- -D warnings
+      - run: mbx test --workspace --locked
+
+  report:
+    needs: [merge, test]
+    if: always() && needs.merge.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      BRANCH: ${{ needs.merge.outputs.branch }}
+    steps:
+      # A green run takes the pull request out of draft; a red one leaves it a
+      # draft with a pointer to the run.
+      - name: Mark it ready, or say the tests failed
+        run: |
+          if [ "${{ needs.test.result }}" = success ]; then
+            gh pr ready "$BRANCH"
+          else
+            gh pr comment "$BRANCH" --body "The tests did not pass (${{ needs.test.result }}): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
