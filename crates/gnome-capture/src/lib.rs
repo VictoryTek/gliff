@@ -40,6 +40,8 @@ pub struct Options {
     /// Without it the stream takes the producer's own size (1920x1080 for a
     /// virtual monitor).
     pub size: Option<(u32, u32)>,
+    /// Ask for this scale from the start (a virtual monitor only).
+    pub scale: Option<f64>,
 }
 
 impl Options {
@@ -51,6 +53,7 @@ impl Options {
             buffers: 3,
             max_size: None,
             size: None,
+            scale: None,
         }
     }
 }
@@ -79,7 +82,7 @@ pub(crate) enum Cmd {
     Request,
     Recapture,
     Release { index: usize, generation: u64 },
-    Resize { width: u32, height: u32 },
+    Resize { width: u32, height: u32, scale: f64 },
     Stop,
 }
 
@@ -130,11 +133,15 @@ impl Capturer {
         self.send(Cmd::Recapture)
     }
 
-    /// Ask the stream for a new size. Only a virtual monitor follows (it is
+    /// Ask the stream for a new size and scale. Only a virtual monitor follows (it is
     /// resized to match); a real monitor keeps its mode. The consumer learns
     /// the result as a new [`CaptureEvent::Ready`], if it comes.
-    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
-        self.send(Cmd::Resize { width, height })
+    pub fn resize(&self, width: u32, height: u32, scale: f64) -> Result<()> {
+        self.send(Cmd::Resize {
+            width,
+            height,
+            scale,
+        })
     }
 
     pub fn stats(&self) -> &Stats {

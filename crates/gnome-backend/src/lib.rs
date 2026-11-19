@@ -59,6 +59,7 @@ struct Virtual {
 // Fields drop in order: capture, session, then the inhibition.
 struct Mirror {
     connector: String,
+    serial: String,
     capturer: Capturer,
     session: Session,
     stream: Stream,
@@ -101,7 +102,7 @@ impl Held {
                 .session
                 .monitors()?
                 .into_iter()
-                .find(|mon| mon.connector == m.connector)
+                .find(|mon| mon.connector == m.connector && mon.serial == m.serial)
                 .ok_or_else(|| anyhow!("monitor {} is gone", m.connector)),
         }
     }
@@ -137,18 +138,24 @@ impl GnomeBackend {
 impl Backend for GnomeBackend {
     fn list_outputs(&self) -> Result<Vec<OutputInfo>> {
         // Our virtual monitors go by the names the server gave them.
-        let ours: HashMap<String, String> = self
+        let ours: HashMap<(String, String), String> = self
             .slots()
             .iter()
             .filter_map(|(name, slot)| match slot {
-                Slot::Virtual(v) => Some((v.out.connector().to_string(), name.clone())),
+                Slot::Virtual(v) => Some((
+                    (v.out.connector().to_string(), v.out.serial().to_string()),
+                    name.clone(),
+                )),
                 Slot::Mirror(_) => None,
             })
             .collect();
         Ok(mutter::monitors(&self.conn)?
             .into_iter()
             .map(|m| OutputInfo {
-                name: ours.get(&m.connector).cloned().unwrap_or(m.connector),
+                name: ours
+                    .get(&(m.connector.clone(), m.serial.clone()))
+                    .cloned()
+                    .unwrap_or(m.connector),
                 width: m.width,
                 height: m.height,
                 scale: m.scale as f32,
@@ -179,7 +186,7 @@ impl Backend for GnomeBackend {
                     .event(event)
             })
         };
-        let out = VirtualOutput::create(&self.desktop, FIRST_SIZE, CursorMode::Metadata, sink)
+        let out = VirtualOutput::create(&self.desktop, FIRST_SIZE, 1.0, CursorMode::Metadata, sink)
             .map_err(fail)?;
         tracing::info!(name, connector = out.connector(), "virtual output created");
         self.slots().insert(
@@ -189,16 +196,17 @@ impl Backend for GnomeBackend {
         Ok(())
     }
 
-    /// Only the size is applied: a virtual monitor is scale 1 and 60 Hz.
-    fn set_mode(&self, name: &str, width: u32, height: u32, _hz: u32, scale: f32) -> Result<()> {
+    /// Only the size is applied; a virtual output stays at scale 1 and 60 Hz.
+    /// `VirtualOutput` can ask Mutter for another scale, but it is held back:
+    /// on the software-rendered test VM, creating a 2560x1440 monitor at
+    /// scale 1.75 crashed GNOME Shell and ended the session, and a scale
+    /// change at the same size has no effect. See docs/PLAN.md.
+    fn set_mode(&self, name: &str, width: u32, height: u32, _hz: u32, _scale: f32) -> Result<()> {
         let held = self.held(name).ok_or_else(|| anyhow!("no output {name}"))?;
         let Held::Virtual(v) = held else {
             bail!("{name} is a real monitor; its mode is not changed");
         };
-        if (scale - 1.0).abs() > 0.01 {
-            tracing::debug!(scale, "a virtual output stays at scale 1");
-        }
-        v.out.resize(width, height)
+        v.out.resize(width, height, 1.0)
     }
 
     fn remove_output(&self, name: &str) -> Result<()> {
@@ -283,6 +291,7 @@ impl Backend for GnomeBackend {
         let capturer = Capturer::start(options, sink)?;
         let mirror = Arc::new(Mirror {
             connector: monitor.connector.clone(),
+            serial: monitor.serial.clone(),
             capturer,
             session,
             stream,

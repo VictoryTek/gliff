@@ -19,6 +19,12 @@ use crate::{Capturer, EventSink, Options};
 
 const STEP: Duration = Duration::from_millis(50);
 
+/// Mutter reuses a connector name once its monitor is gone, so a monitor is
+/// told apart by its serial too.
+fn same_monitor(a: &Monitor, b: &Monitor) -> bool {
+    a.connector == b.connector && a.serial == b.serial
+}
+
 /// Hold this while a new monitor is being identified. The monitor is named by
 /// what is new in `DisplayConfig`, so two creations at once (two gliff
 /// processes) could both take the first new one. A lock file in the runtime
@@ -39,17 +45,19 @@ pub struct VirtualOutput {
     session: Session,
     stream: Stream,
     connector: String,
+    serial: String,
     _inhibitor: IdleInhibitor,
 }
 
 impl VirtualOutput {
-    /// Create a virtual monitor of `size`. A blanked screen is woken first
+    /// Create a virtual monitor of `size`, at `scale` if Mutter supports it. A blanked screen is woken first
     /// (Mutter refuses new sessions on a blanked screen) and the desktop is
     /// kept from going idle until the output is dropped. Capture events go to
     /// `sink` from the start, the first `Ready` included.
     pub fn create(
         desktop: &GraphicalSession,
         size: (u32, u32),
+        scale: f64,
         cursor: CursorMode,
         sink: EventSink,
     ) -> Result<Self> {
@@ -65,6 +73,7 @@ impl VirtualOutput {
         let node = stream.wait_node(Duration::from_secs(5))?;
         let mut options = Options::new(node, &desktop.runtime_dir, "virtual");
         options.size = Some(size);
+        options.scale = Some(scale);
         let capturer = Capturer::start(options, sink)?;
 
         // The monitor appears once the stream has a format. Name it by what
@@ -74,7 +83,7 @@ impl VirtualOutput {
             let found = session
                 .monitors()?
                 .into_iter()
-                .find(|m| !before.iter().any(|b| b.connector == m.connector));
+                .find(|m| !before.iter().any(|b| same_monitor(b, m)));
             match found {
                 Some(m) => break m,
                 None if Instant::now() < deadline => std::thread::sleep(STEP),
@@ -91,6 +100,7 @@ impl VirtualOutput {
             session,
             stream,
             connector: monitor.connector,
+            serial: monitor.serial,
             _inhibitor: inhibitor,
         })
     }
@@ -100,12 +110,18 @@ impl VirtualOutput {
         &self.connector
     }
 
+    /// The monitor's serial, which tells it from an earlier monitor that had
+    /// the same connector name.
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
     /// The monitor as Mutter reports it now.
     pub fn monitor(&self) -> Result<Monitor> {
         self.session
             .monitors()?
             .into_iter()
-            .find(|m| m.connector == self.connector)
+            .find(|m| m.connector == self.connector && m.serial == self.serial)
             .ok_or_else(|| anyhow!("monitor {} is gone", self.connector))
     }
 
@@ -126,15 +142,25 @@ impl VirtualOutput {
     }
 
     /// Resize the monitor and wait until Mutter reports the new size.
-    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
-        self.capturer.resize(width, height)?;
+    ///
+    /// `scale` is Mutter's preferred scale for the new mode: it takes the
+    /// nearest scale the mode supports, none that would leave under 800x480
+    /// logical pixels, so read the scale back from [`VirtualOutput::monitor`];
+    /// it gets a moment to settle on `scale` before this returns. Seen on
+    /// GNOME 50.6: the scale is applied when the monitor is created and when
+    /// the size changes, but a new scale at the same size does nothing.
+    pub fn resize(&self, width: u32, height: u32, scale: f64) -> Result<()> {
+        self.capturer.resize(width, height, scale)?;
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut sized = None;
         loop {
             let m = self.monitor()?;
             if (m.width, m.height) == (width, height) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
+                let since = *sized.get_or_insert_with(Instant::now);
+                if (m.scale - scale).abs() < 0.01 || since.elapsed() > Duration::from_secs(1) {
+                    return Ok(());
+                }
+            } else if Instant::now() >= deadline {
                 bail!(
                     "asked for {width}x{height}, Mutter still reports {}x{}",
                     m.width,
@@ -147,7 +173,7 @@ impl VirtualOutput {
 
     /// Remove the monitor and wait until Mutter no longer lists it.
     pub fn close(self) -> Result<()> {
-        let connector = self.connector.clone();
+        let (connector, serial) = (self.connector.clone(), self.serial.clone());
         let Self {
             capturer,
             mut session,
@@ -157,7 +183,11 @@ impl VirtualOutput {
         session.stop()?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if !session.monitors()?.iter().any(|m| m.connector == connector) {
+            if !session
+                .monitors()?
+                .iter()
+                .any(|m| m.connector == connector && m.serial == serial)
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {

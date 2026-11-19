@@ -70,6 +70,10 @@ pub fn versions(conn: &Connection) -> Result<(i32, i32)> {
 pub struct Monitor {
     /// The connector name (`DP-1`), which `RecordMonitor` takes.
     pub connector: String,
+    /// The monitor's serial. Mutter numbers virtual monitors, so a connector
+    /// name that a removed virtual monitor had and a new one takes over
+    /// (`Meta-0`) still tells them apart.
+    pub serial: String,
     /// Size of the current mode.
     pub width: u32,
     pub height: u32,
@@ -119,7 +123,8 @@ fn build_monitors(mons: &[Mon], logical: &[Logical]) -> Vec<Monitor> {
     let mut out = Vec::new();
     for (x, y, scale, _transform, primary, members, _) in logical {
         for (connector, ..) in members {
-            let Some((_, modes, _)) = mons.iter().find(|m| &m.0 .0 == connector) else {
+            let Some(((_, _, _, serial), modes, _)) = mons.iter().find(|m| &m.0 .0 == connector)
+            else {
                 continue;
             };
             let is_current = |m: &&Mode| {
@@ -132,6 +137,7 @@ fn build_monitors(mons: &[Mon], logical: &[Logical]) -> Vec<Monitor> {
             };
             out.push(Monitor {
                 connector: connector.clone(),
+                serial: serial.clone(),
                 width: mode.1.max(0) as u32,
                 height: mode.2.max(0) as u32,
                 refresh_hz: mode.3,
@@ -390,6 +396,7 @@ mod tests {
             (m[0].connector.as_str(), m[0].width, m[0].height),
             ("DP-1", 1920, 1080)
         );
+        assert_eq!(m[0].serial, "S");
         assert!(m[0].primary && !m[1].primary);
         assert_eq!((m[1].x, m[1].scale), (960, 2.0));
     }

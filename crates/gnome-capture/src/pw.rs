@@ -52,6 +52,31 @@ fn serialize(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
+/// A PipeWire tag telling Mutter which scale a virtual monitor should have
+/// (`org.gnome.preferred-scale`). Mutter takes the nearest scale the mode
+/// supports and reports the one it chose back as the `org.gnome.scale` tag.
+fn scale_tag(scale: f64) -> Vec<u8> {
+    serialize(Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_ParamTag,
+        id: spa_sys::SPA_PARAM_Tag,
+        properties: vec![
+            Property::new(
+                spa_sys::SPA_PARAM_TAG_direction,
+                Value::Id(spa::utils::Id(spa_sys::SPA_DIRECTION_INPUT)),
+            ),
+            Property::new(
+                spa_sys::SPA_PARAM_TAG_info,
+                // A count, then key and value for each item.
+                Value::Struct(vec![
+                    Value::Int(1),
+                    Value::String("org.gnome.preferred-scale".into()),
+                    Value::String(format!("{scale}")),
+                ]),
+            ),
+        ],
+    })
+}
+
 /// The format we accept. With `fixed`, the size is that one size, which asks
 /// a virtual monitor to take it; without, any size, which lets the producer
 /// choose.
@@ -427,6 +452,7 @@ fn run_inner(
 
     let node = options.node;
     let node_size = options.size;
+    let node_scale = options.scale;
     let release_tx = command_tx;
     let state = Rc::new(RefCell::new(State {
         sink,
@@ -453,9 +479,18 @@ fn run_inner(
         commands.attach(mainloop.loop_(), move |cmd| match cmd {
             // Asking for a new fixed size makes the producer renegotiate, and
             // `param_changed` below then builds the new ring.
-            Cmd::Resize { width, height } => {
-                let format = enum_format(Some((width, height)));
-                let mut params = [Pod::from_bytes(&format).expect("format pod")];
+            Cmd::Resize {
+                width,
+                height,
+                scale,
+            } => {
+                // The scale goes first: Mutter reads it when the format
+                // arrives.
+                let (tag, format) = (scale_tag(scale), enum_format(Some((width, height))));
+                let mut params = [
+                    Pod::from_bytes(&tag).expect("tag pod"),
+                    Pod::from_bytes(&format).expect("format pod"),
+                ];
                 if let Err(e) = stream.update_params(&mut params) {
                     st.borrow_mut().fail(format!("resize: {e}"));
                 }
@@ -530,7 +565,11 @@ fn run_inner(
         .map_err(|e| err("stream listener")(&e))?;
 
     let format = enum_format(node_size);
-    let mut params = [Pod::from_bytes(&format).expect("format pod")];
+    let tag = node_scale.map(scale_tag);
+    let mut params = vec![Pod::from_bytes(&format).expect("format pod")];
+    if let Some(tag) = &tag {
+        params.insert(0, Pod::from_bytes(tag).expect("tag pod"));
+    }
     stream
         .connect(
             spa::utils::Direction::Input,

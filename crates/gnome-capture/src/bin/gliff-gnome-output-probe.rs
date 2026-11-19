@@ -4,6 +4,8 @@
 //! One line per check, `[ OK ]` or `[FAIL]`, with the raw detail.
 //!
 //!   gliff-gnome-output-probe            create, resize, two at once, remove
+//!   gliff-gnome-output-probe scales     resize through sizes and scales and report
+//!                                       what Mutter chose
 //!   gliff-gnome-output-probe hold SECS  keep one output for SECS seconds and
 //!                                       report the screen state every 10 s
 //!   gliff-gnome-output-probe idle SECS  no output: report the screen state
@@ -28,10 +30,19 @@ fn create(
     desktop: &GraphicalSession,
     size: (u32, u32),
 ) -> anyhow::Result<(VirtualOutput, Receiver<CaptureEvent>)> {
+    create_at(desktop, size, 1.0)
+}
+
+fn create_at(
+    desktop: &GraphicalSession,
+    size: (u32, u32),
+    scale: f64,
+) -> anyhow::Result<(VirtualOutput, Receiver<CaptureEvent>)> {
     let (tx, rx) = mpsc::channel();
     let out = VirtualOutput::create(
         desktop,
         size,
+        scale,
         CursorMode::Metadata,
         Box::new(move |ev| {
             let _ = tx.send(ev);
@@ -60,7 +71,8 @@ fn frame_size(
                 let nonzero = img.pixels.iter().any(|b| *b != 0);
                 // read_bgra crops to even sizes.
                 let got = (img.width as u32, img.height as u32);
-                if ready == Some(want) && got == (want.0 & !1, want.1 & !1) {
+                // A request for the size it already has brings no new `Ready`.
+                if ready.is_none_or(|r| r == want) && got == (want.0 & !1, want.1 & !1) {
                     return if nonzero {
                         Ok(got)
                     } else {
@@ -151,7 +163,7 @@ fn run(desktop: &GraphicalSession) -> bool {
         (1280, 720),
     ] {
         let t = Instant::now();
-        match out.resize(size.0, size.1) {
+        match out.resize(size.0, size.1, 1.0) {
             Ok(()) => ok(
                 "resize",
                 format!("{size:?} reported after {:.0?}", t.elapsed()),
@@ -178,7 +190,7 @@ fn run(desktop: &GraphicalSession) -> bool {
                     format!("{} beside {}", second.connector(), out.connector()),
                 );
             }
-            let a = second.resize(800, 600);
+            let a = second.resize(800, 600, 1.0);
             let b = out.monitor().map(|m| (m.width, m.height));
             match (a, b) {
                 (Ok(()), Ok((1280, 720))) => ok("second resize", "the first output kept its size"),
@@ -221,6 +233,73 @@ fn run(desktop: &GraphicalSession) -> bool {
             ),
         ),
         Err(e) => healthy &= fail("monitors", format!("{e:#}")),
+    }
+    healthy
+}
+
+/// A new output for each size and scale, to see which scales Mutter gives.
+fn fresh(desktop: &GraphicalSession) -> bool {
+    let mut healthy = true;
+    for size in [(1920, 1080), (2560, 1440), (3840, 2160)] {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            match create_at(desktop, size, scale) {
+                Ok((out, _rx)) => {
+                    match out.monitor() {
+                        Ok(m) => ok(
+                            "fresh",
+                            format!(
+                                "{size:?} asked {scale}: reports {}x{} at {}",
+                                m.width, m.height, m.scale
+                            ),
+                        ),
+                        Err(e) => healthy &= fail("fresh", format!("{e:#}")),
+                    }
+                    let _ = out.close();
+                }
+                Err(e) => healthy &= fail("fresh", format!("{size:?} at {scale}: {e:#}")),
+            }
+        }
+    }
+    healthy
+}
+
+/// Ask for sizes and scales and say what Mutter reports and delivers.
+fn scales(desktop: &GraphicalSession) -> bool {
+    let (out, rx) = match create(desktop, (1280, 720)) {
+        Ok(v) => v,
+        Err(e) => return fail("create", format!("{e:#}")),
+    };
+    let mut healthy = true;
+    let steps = [
+        ((1280, 720), 2.0),
+        ((1280, 720), 1.0),
+        ((1920, 1080), 1.5),
+        ((1920, 1080), 1.25),
+        ((2560, 1440), 2.0),
+        ((1920, 1080), 1.0),
+    ];
+    for (size, scale) in steps {
+        match out.resize(size.0, size.1, scale) {
+            Ok(()) => match out.monitor() {
+                Ok(m) => ok(
+                    "scale",
+                    format!(
+                        "asked {size:?} at {scale}: Mutter reports {}x{} at {} (logical {:.0}x{:.0})",
+                        m.width,
+                        m.height,
+                        m.scale,
+                        f64::from(m.width) / m.scale,
+                        f64::from(m.height) / m.scale
+                    ),
+                ),
+                Err(e) => healthy &= fail("scale", format!("{e:#}")),
+            },
+            Err(e) => healthy &= fail("scale", format!("asked {size:?} at {scale}: {e:#}")),
+        }
+        match frame_size(&out, &rx, size) {
+            Ok(s) => ok("scale frame", format!("{}x{} with pixels", s.0, s.1)),
+            Err(e) => healthy &= fail("scale frame", e),
+        }
     }
     healthy
 }
@@ -284,6 +363,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let healthy = match args.first().map(String::as_str) {
         None => run(&desktop),
+        Some("scales") => scales(&desktop),
+        Some("fresh") => fresh(&desktop),
         Some(mode @ ("hold" | "idle")) => {
             let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
             watch(&desktop, secs, mode == "hold")

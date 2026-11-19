@@ -126,3 +126,19 @@ gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application 
 `serve_probe` is a headless gliff client: it checks the greeting, the first
 frame, the new monitor, the pointer, the cursor shape, resizes and that the
 monitors are back to normal afterwards. It does not decode video.
+
+## The viewer on GNOME
+
+The `gliff` viewer needs no GNOME-specific code: it reads the local keymap and
+picks the render node through ordinary Wayland protocols. Two GNOME behaviours
+show up when you use it:
+
+- The first time the window takes the keyboard, GNOME Shell asks whether to
+  allow capturing system shortcuts, and asks again on every launch (the
+  viewer has no application id, so GNOME has nothing to remember the answer
+  for). Until you allow it, shortcuts such as Super stay with the local
+  desktop.
+- A private (`--headless`) screen is always scale 1, so on a HiDPI display
+  the remote desktop looks small. Mutter can give a virtual monitor another
+  scale, but that crashed GNOME Shell on the software-rendered test VM, so it
+  is off; see the "M4 part 1 result" entry in `docs/PLAN.md`.

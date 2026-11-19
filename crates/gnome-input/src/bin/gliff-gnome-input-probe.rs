@@ -9,6 +9,7 @@
 //!   type:TEXT             letters, digits, space (US layout), sent as keys
 //!   wheel:N               N wheel steps down (negative: up)
 //!   paste | copy          press Ctrl+Shift+V / Ctrl+Shift+C (a terminal's paste and copy)
+//!   key:tab|enter|esc|left|right   tap one named key
 //!   caps                  tap Caps Lock twice and check it toggled and returned
 //!   wait:MS
 //!
@@ -249,6 +250,19 @@ fn run(actions: &[String]) -> bool {
                 );
                 Ok(())
             }
+            "key" => {
+                let code = match arg {
+                    "tab" => 15,
+                    "enter" => 28,
+                    "esc" => 1,
+                    "left" => 105,
+                    "right" => 106,
+                    _ => return Err("key:tab|enter|esc|left|right".to_string()),
+                };
+                tap(&input, code).map_err(|e| format!("{e:#}"))?;
+                ok("key", arg);
+                Ok(())
+            }
             "caps" => {
                 let before = port.lock_state().map_err(|e| format!("{e:#}"))?.0;
                 tap(&input, KEY_CAPSLOCK).map_err(|e| format!("{e:#}"))?;
@@ -289,7 +303,7 @@ fn run(actions: &[String]) -> bool {
 fn main() {
     let actions: Vec<String> = std::env::args().skip(1).collect();
     if actions.is_empty() {
-        eprintln!("usage: gliff-gnome-input-probe ACTION...  (move:X,Y click[:left|right|middle] type:TEXT wheel:N paste copy caps wait:MS)");
+        eprintln!("usage: gliff-gnome-input-probe ACTION...  (move:X,Y click[:left|right|middle] type:TEXT key:NAME wheel:N paste copy caps wait:MS)");
         std::process::exit(2);
     }
     std::process::exit(if run(&actions) { 0 } else { 1 });
