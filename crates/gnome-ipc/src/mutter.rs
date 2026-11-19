@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -157,7 +157,8 @@ pub enum StreamSource {
 /// A recorded source. The PipeWire node appears once the session starts.
 pub struct Stream {
     path: OwnedObjectPath,
-    node: Receiver<u32>,
+    // In a mutex so a `Stream` can be shared between threads.
+    node: Mutex<Receiver<u32>>,
 }
 
 impl Stream {
@@ -170,6 +171,8 @@ impl Stream {
     /// The PipeWire node id, once `Mutter` has started the stream.
     pub fn wait_node(&self, timeout: Duration) -> Result<u32> {
         self.node
+            .lock()
+            .map_err(|_| anyhow!("stream state poisoned"))?
             .recv_timeout(timeout)
             .map_err(|_| anyhow!("no PipeWireStreamAdded signal within {timeout:?}"))
     }
@@ -311,7 +314,10 @@ impl Session {
                 }
             }
         });
-        Ok(Stream { path, node })
+        Ok(Stream {
+            path,
+            node: Mutex::new(node),
+        })
     }
 
     /// Start the sessions. Starting the RemoteDesktop session starts the

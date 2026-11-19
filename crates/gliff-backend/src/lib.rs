@@ -106,4 +106,10 @@ pub trait Backend: Send + Sync {
     fn start_input(&self, config: InputConfig) -> Result<Box<dyn InputControl>>;
 
     fn start_clipboard(&self, sink: ClipboardSink) -> Result<Box<dyn ClipboardControl>>;
+
+    /// A capture mode this backend needs whatever the user asked for, for a
+    /// backend that cannot produce every kind of buffer.
+    fn forced_capture_mode(&self) -> Option<CaptureMode> {
+        None
+    }
 }

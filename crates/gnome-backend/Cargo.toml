@@ -1,0 +1,28 @@
+[package]
+name = "gnome-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "gliff's Backend for a GNOME desktop, built from the gnome-* crates"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gliff-backend.workspace = true
+gnome-capture = { path = "../gnome-capture" }
+gnome-clipboard = { path = "../gnome-clipboard" }
+gnome-input = { path = "../gnome-input" }
+gnome-ipc = { path = "../gnome-ipc" }
+tracing.workspace = true
+zbus = "5"
+
+# For the serve_probe example only: a headless gliff client that drives a real
+# gliff-server, so none of this is in the library.
+[dev-dependencies]
+bytes.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "rt"] }

@@ -104,3 +104,25 @@ blanks the screen on purpose to test the wake, so run it on a test machine.
 The monitor exists only while something reads its stream, and Mutter sizes it
 from the format the reader asks for, so a resize is a new format request. The
 virtual monitor is always scale 1.
+
+## Running the server on GNOME
+
+`gliff-server` picks Hyprland when an instance is running and GNOME otherwise
+(`crates/gliff-server/src/backend.rs`); nothing needs to be configured. It
+runs with the CPU video pipeline, because capture is shared memory only until
+dmabuf capture exists. A mirrored session (the default) shows the real screen;
+`--headless` creates a private screen the size of the viewer's window, which
+lives as long as the session. To check the whole path without a viewer, run
+this on the GNOME machine:
+
+```
+cargo build -p gliff-server -p gnome-backend --example serve_probe
+serve_probe target/debug/gliff-server --headless      # or without --headless to mirror
+serve_probe target/debug/gliff-server --headless --clipboard 6   # also offers a selection and waits 6 s
+gliff-gnome-clipboard-probe rawserve "text" 14        # an ordinary application copying, in another shell
+gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application watching
+```
+
+`serve_probe` is a headless gliff client: it checks the greeting, the first
+frame, the new monitor, the pointer, the cursor shape, resizes and that the
+monitors are back to normal afterwards. It does not decode video.

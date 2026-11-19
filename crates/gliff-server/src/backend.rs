@@ -2,13 +2,23 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use gliff_backend::Backend;
+use gnome_backend::GnomeBackend;
 use hypr_wl::Target;
 
 use crate::hypr_backend::HyprBackend;
 
-/// Hyprland is the only backend today.
+/// Hyprland when an instance is running, else GNOME.
 pub fn discover(target: &Target) -> Result<Arc<dyn Backend>> {
-    Ok(Arc::new(HyprBackend::discover(target)?))
+    let hypr = match HyprBackend::discover(target) {
+        Ok(backend) => return Ok(Arc::new(backend)),
+        Err(e) => e,
+    };
+    match GnomeBackend::discover() {
+        Ok(backend) => Ok(Arc::new(backend)),
+        Err(gnome) => Err(anyhow!(
+            "no supported desktop found. Hyprland: {hypr:#}. GNOME: {gnome:#}"
+        )),
+    }
 }

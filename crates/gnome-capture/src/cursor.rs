@@ -4,6 +4,12 @@
 //! moves the pointer, changes its image or hides it, so the id says nothing
 //! about what changed. A bitmap in the metadata is a new image; an empty
 //! bitmap hides the cursor; no bitmap leaves the image as it was.
+//!
+//! Mutter sends the image once, when the cursor first shows up on the stream,
+//! and again only when it changes. A consumer that misses that one buffer (or
+//! that connects while the cursor is elsewhere, as on a new virtual monitor)
+//! would be told where the cursor is but never what it looks like, so until a
+//! real image arrives the tracker supplies a plain arrow.
 
 use hypr_capture::CaptureEvent;
 
@@ -22,8 +28,55 @@ pub(crate) enum Sprite {
     },
 }
 
+/// A plain arrow, `X` black, `o` white, `.` clear. The hotspot is the tip.
+const ARROW: [&str; 19] = [
+    "X...........",
+    "XX..........",
+    "XoX.........",
+    "XooX........",
+    "XoooX.......",
+    "XooooX......",
+    "XoooooX.....",
+    "XooooooX....",
+    "XoooooooX...",
+    "XooooooooX..",
+    "XoooooXXXXXX",
+    "XooXooX.....",
+    "XoX.XooX....",
+    "XX..XooX....",
+    "X....XooX...",
+    ".....XooX...",
+    "......XooX..",
+    "......XooX..",
+    ".......XX...",
+];
+
+fn arrow() -> CaptureEvent {
+    let width = ARROW[0].len() as u32;
+    let mut argb = Vec::with_capacity(ARROW.len() * ARROW[0].len() * 4);
+    for row in ARROW {
+        for c in row.bytes() {
+            // BGRA bytes, as Mutter's bitmaps are.
+            argb.extend_from_slice(match c {
+                b'X' => &[0, 0, 0, 255],
+                b'o' => &[255, 255, 255, 255],
+                _ => &[0, 0, 0, 0],
+            });
+        }
+    }
+    CaptureEvent::CursorShape {
+        width,
+        height: ARROW.len() as u32,
+        hot_x: 0,
+        hot_y: 0,
+        argb,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CursorTracker {
+    /// Whether the consumer has been given any image.
+    shape_known: bool,
     visible: bool,
     /// The last position and visibility the consumer was told.
     reported: Option<((i32, i32), bool)>,
@@ -32,6 +85,7 @@ pub(crate) struct CursorTracker {
 impl CursorTracker {
     pub(crate) fn new() -> Self {
         Self {
+            shape_known: false,
             visible: true,
             reported: None,
         }
@@ -51,6 +105,7 @@ impl CursorTracker {
                 argb,
             } => {
                 self.visible = true;
+                self.shape_known = true;
                 events.push(CaptureEvent::CursorShape {
                     width,
                     height,
@@ -61,6 +116,10 @@ impl CursorTracker {
             }
         }
         if self.reported != Some((position, self.visible)) {
+            if self.visible && !self.shape_known {
+                self.shape_known = true;
+                events.push(arrow());
+            }
             self.reported = Some((position, self.visible));
             events.push(CaptureEvent::CursorPos {
                 x: position.0,
@@ -100,12 +159,49 @@ mod tests {
     #[test]
     fn a_position_only_first_update_still_lets_a_later_shape_through() {
         let mut c = CursorTracker::new();
-        assert_eq!(kinds(&c.update((1, 2), Sprite::Unchanged)), ["pos1,2,true"]);
+        assert_eq!(
+            kinds(&c.update((1, 2), Sprite::Unchanged)),
+            ["shape12", "pos1,2,true"],
+            "no image yet: the plain arrow stands in"
+        );
         assert_eq!(
             kinds(&c.update((1, 2), shape(24))),
             ["shape24"],
             "same position, new image"
         );
+    }
+
+    #[test]
+    fn the_arrow_is_only_a_stand_in() {
+        let mut c = CursorTracker::new();
+        c.update((0, 0), shape(24));
+        assert_eq!(
+            kinds(&c.update((3, 4), Sprite::Unchanged)),
+            ["pos3,4,true"],
+            "a real image was already sent"
+        );
+        let mut hidden = CursorTracker::new();
+        assert_eq!(
+            kinds(&hidden.update((0, 0), Sprite::Hidden)),
+            ["pos0,0,false"],
+            "nothing to draw, so no stand-in"
+        );
+    }
+
+    #[test]
+    fn the_arrow_is_a_well_formed_bitmap() {
+        let CaptureEvent::CursorShape {
+            width,
+            height,
+            argb,
+            ..
+        } = arrow()
+        else {
+            panic!("not a shape")
+        };
+        assert!(ARROW.iter().all(|r| r.len() == width as usize));
+        assert_eq!(argb.len(), (width * height * 4) as usize);
+        assert_eq!(&argb[..4], &[0, 0, 0, 255], "the tip is opaque black");
     }
 
     #[test]

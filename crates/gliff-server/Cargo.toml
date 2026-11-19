@@ -18,6 +18,7 @@ bytes.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-backend.workspace = true
+gnome-backend = { path = "../gnome-backend" }
 gliff-vk.workspace = true
 gliff-sw.workspace = true
 drm-fourcc.workspace = true

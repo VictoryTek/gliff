@@ -8,6 +8,12 @@
 //!                       every paste; paste into a test window to try it
 //!   watch SECS          report what the desktop's selection offers and read it
 //!
+//!   rawserve TEXT SECS  like `serve`, but as a plain Mutter client, with none of
+//!                       the bridge's rules (so a gliff server sees it as an
+//!                       ordinary application)
+//!   rawwatch SECS       like `watch`, as a plain client: also sees what a
+//!                       gliff server offers, marker type and all
+//!
 //! One line per check, `[ OK ]` or `[FAIL]`. `roundtrip` replaces the
 //! desktop's selection: run it where that is fine.
 
@@ -437,6 +443,45 @@ fn watch(address: &str, secs: u64) -> bool {
     true
 }
 
+fn raw_serve(address: &str, text: &str, secs: u64) -> bool {
+    let raw = match Raw::start(address, text.as_bytes()) {
+        Ok(r) => r,
+        Err(e) => return fail("raw serve", e),
+    };
+    raw.offer(&[TEXT]);
+    ok("raw offer", format!("{text:?} for {secs} s"));
+    let seen = raw.reports_while_empty(Duration::from_secs(secs));
+    ok("raw reports", format!("{seen:?}"));
+    true
+}
+
+fn raw_watch(address: &str, secs: u64) -> bool {
+    let raw = match Raw::start(address, b"") {
+        Ok(r) => r,
+        Err(e) => return fail("raw watch", e),
+    };
+    let end = Instant::now() + Duration::from_secs(secs);
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        let Ok(types) = raw.selections.recv_timeout(left) else {
+            break;
+        };
+        ok("raw selection", format!("{types:?}"));
+        if types.iter().any(|t| t == TEXT) {
+            let text = raw
+                .port
+                .selection_read(TEXT)
+                .and_then(into_blocking)
+                .map(|fd| {
+                    let mut text = String::new();
+                    let _ = std::fs::File::from(fd).read_to_string(&mut text);
+                    text
+                });
+            ok("raw read", format!("{text:?}"));
+        }
+    }
+    true
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let address = match discover::find() {
@@ -455,9 +500,11 @@ fn main() {
         ["roundtrip"] => roundtrip(&address),
         ["serve", text, secs] => serve(&address, text, secs.parse().unwrap_or(10)),
         ["watch", secs] => watch(&address, secs.parse().unwrap_or(10)),
+        ["rawserve", text, secs] => raw_serve(&address, text, secs.parse().unwrap_or(10)),
+        ["rawwatch", secs] => raw_watch(&address, secs.parse().unwrap_or(10)),
         _ => {
             eprintln!(
-                "usage: gliff-gnome-clipboard-probe roundtrip | serve TEXT SECS | watch SECS"
+                "usage: gliff-gnome-clipboard-probe roundtrip | serve TEXT SECS | watch SECS | rawserve TEXT SECS | rawwatch SECS"
             );
             std::process::exit(2);
         }

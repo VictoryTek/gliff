@@ -102,6 +102,10 @@ where
     }
 
     let backend = report_setup(&mut writer, crate::backend::discover(&cfg.target)).await?;
+    let cfg = Config {
+        capture: backend.forced_capture_mode().unwrap_or(cfg.capture),
+        ..cfg
+    };
     let output = report_setup(&mut writer, setup_output(&backend, &cfg, &caps)).await?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 

@@ -5,6 +5,7 @@ members = [
     "crates/gliff-transport",
     "crates/gliff-backend",
     "crates/gnome-ipc",
+    "crates/gnome-backend",
     "crates/gnome-capture",
     "crates/gnome-input",
     "crates/gnome-clipboard",
