@@ -30,7 +30,6 @@ pub fn is_blanked(conn: &Connection) -> Result<bool> {
         .context("ScreenSaver.GetActive")
 }
 
-/// Switch the screen saver off if it is on. Returns whether it was.
 /// Blank the screen as the idle delay would. For tests.
 pub fn blank(conn: &Connection) -> Result<()> {
     proxy(conn, SCREENSAVER, SCREENSAVER_PATH, SCREENSAVER)?
@@ -38,6 +37,9 @@ pub fn blank(conn: &Connection) -> Result<()> {
         .context("ScreenSaver.SetActive(true)")
 }
 
+/// Switch the screen saver off if it is on, and wait until the shell says it
+/// is off (the unblank animation takes up to about a second on a real
+/// display). Returns whether it was on.
 pub fn wake(conn: &Connection) -> Result<bool> {
     if !is_blanked(conn)? {
         return Ok(false);
@@ -45,6 +47,10 @@ pub fn wake(conn: &Connection) -> Result<bool> {
     proxy(conn, SCREENSAVER, SCREENSAVER_PATH, SCREENSAVER)?
         .call::<_, _, ()>("SetActive", &(false,))
         .context("ScreenSaver.SetActive(false)")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while is_blanked(conn)? && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     Ok(true)
 }
 
