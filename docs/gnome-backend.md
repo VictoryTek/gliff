@@ -129,8 +129,11 @@ uses the CPU pipeline and shared memory. If the first GPU encode fails (say the
 dmabuf comes from another GPU than the one the server encodes on), the server
 falls back to the CPU pipeline by itself. A headless session is first offered
 dmabufs for the render node the server would pick by default
-(`GLIFF_RENDER_NODE`, else `renderD128`); with a different `--render-node` the
-GPU path may fail and fall back as just described. A mirrored session (the default) shows the real screen;
+(`GLIFF_RENDER_NODE`, else `renderD128`); when the server uses another node
+(`--render-node`) the headless session switches to shared memory and the CPU
+pipeline, since a dmabuf made for one GPU can lose another GPU's Vulkan device
+when imported. Set `GLIFF_RENDER_NODE` to the GPU Mutter renders on to keep the
+GPU pipeline on such a machine. A mirrored session (the default) shows the real screen;
 `--headless` creates a private screen the size of the viewer's window, which
 lives as long as the session. To check the whole path without a viewer, run
 this on the GNOME machine:

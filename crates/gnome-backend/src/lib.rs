@@ -48,6 +48,15 @@ use forward::Forward;
 /// The size a virtual output starts at; the server resizes it at once.
 const FIRST_SIZE: (u32, u32) = (1920, 1080);
 
+/// Whether two render node paths are the same device.
+fn same_node(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// What a stream offers Mutter: the modifiers the GPU can import per format.
 type Offer = Vec<(DrmFourcc, Vec<u64>)>;
 
@@ -72,6 +81,8 @@ enum Slot {
 struct Virtual {
     out: VirtualOutput,
     forward: Arc<Mutex<Forward>>,
+    /// The render node its dmabufs were offered for.
+    node: PathBuf,
 }
 
 /// A real monitor being captured.
@@ -250,7 +261,11 @@ impl Backend for GnomeBackend {
         tracing::info!(name, connector = out.connector(), "virtual output created");
         self.slots().insert(
             name.to_string(),
-            Slot::Virtual(Arc::new(Virtual { out, forward })),
+            Slot::Virtual(Arc::new(Virtual {
+                out,
+                forward,
+                node: self.default_node.clone(),
+            })),
         );
         Ok(())
     }
@@ -324,7 +339,12 @@ impl Backend for GnomeBackend {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .attach(sink);
-                if needs_shm {
+                // A dmabuf made for another GPU than the server encodes on
+                // can lose the encoder's device when it is imported (seen
+                // between an NVIDIA and an AMD GPU), so that case is shared
+                // memory too.
+                let other_gpu = !same_node(&v.node, &config.render_node);
+                if needs_shm || other_gpu {
                     held.capturer().use_shm()?;
                 }
                 return Ok(Box::new(GnomeCapture(held)));
@@ -435,5 +455,27 @@ impl ClipboardControl for GnomeClipboard {
     }
     fn receive(&self, mime_type: String) -> Result<OwnedFd> {
         self.0.receive(mime_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_same_render_node_by_another_path_is_the_same_node() {
+        let dir = std::env::temp_dir().join(format!("gliff-node-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, link) = (dir.join("a"), dir.join("b"), dir.join("link"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert!(same_node(&a, &a));
+        assert!(same_node(&a, &link));
+        assert!(!same_node(&a, &b));
+        // A path that does not exist is only equal to itself.
+        assert!(same_node(Path::new("/nope"), Path::new("/nope")));
+        assert!(!same_node(Path::new("/nope"), &a));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
