@@ -11,7 +11,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+drm-fourcc.workspace = true
 gliff-backend.workspace = true
+gliff-sw.workspace = true
+gliff-vk.workspace = true
 gnome-capture = { path = "../gnome-capture" }
 gnome-clipboard = { path = "../gnome-clipboard" }
 gnome-input = { path = "../gnome-input" }

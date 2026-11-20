@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Cursor;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -18,8 +18,8 @@ use hypr_capture::{CaptureBuffer, CaptureEvent, EventSink, FrameSource, OutputIn
 use pipewire as pw;
 use pw::spa;
 use pw::spa::buffer::meta::MetaCursor;
-use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
-use pw::spa::pod::{Object, Pod, Property, Value};
+use pw::spa::param::video::{VideoFlags, VideoFormat, VideoInfoRaw};
+use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value};
 use pw::spa::sys as spa_sys;
 use rustix::fs::{memfd_create, MemfdFlags};
 
@@ -37,6 +37,19 @@ fn drm_format(f: VideoFormat) -> Option<DrmFourcc> {
         _ => None,
     }
 }
+
+fn video_format(f: DrmFourcc) -> Option<VideoFormat> {
+    match f {
+        DrmFourcc::Xrgb8888 => Some(VideoFormat::BGRx),
+        DrmFourcc::Argb8888 => Some(VideoFormat::BGRA),
+        DrmFourcc::Xbgr8888 => Some(VideoFormat::RGBx),
+        DrmFourcc::Abgr8888 => Some(VideoFormat::RGBA),
+        _ => None,
+    }
+}
+
+/// `DRM_FORMAT_MOD_INVALID`: what a buffer the GPU cannot import reports.
+const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// Room for a 384x384 cursor bitmap, the biggest we ask for.
 fn cursor_meta_size(side: u32) -> i32 {
@@ -77,81 +90,185 @@ fn scale_tag(scale: f64) -> Vec<u8> {
     })
 }
 
-/// The format we accept. With `fixed`, the size is that one size, which asks
+/// The 32-bit layouts the consumer accepts, in the order it prefers.
+const SHM_FORMATS: [VideoFormat; 4] = [
+    VideoFormat::BGRx,
+    VideoFormat::BGRA,
+    VideoFormat::RGBx,
+    VideoFormat::RGBA,
+];
+
+/// What a format alternative says about modifiers.
+enum Mods<'a> {
+    /// No modifier property: the shared-memory form.
+    None,
+    /// A list the producer may pick from. The property is mandatory and
+    /// "don't fixate", which is how PipeWire's dmabuf negotiation asks the
+    /// producer to choose (or hand the choice back to us).
+    Offer(&'a [u64]),
+    /// This one modifier.
+    Fixed(u64),
+}
+
+/// One format alternative. With `fixed`, the size is that one size, which asks
 /// a virtual monitor to take it; without, any size, which lets the producer
 /// choose.
-fn enum_format(fixed: Option<(u32, u32)>) -> Vec<u8> {
+fn format_pod(fixed: Option<(u32, u32)>, formats: &[VideoFormat], mods: Mods) -> Vec<u8> {
     use spa::param::format::{FormatProperties as F, MediaSubtype, MediaType};
     use spa::pod::ChoiceValue;
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
 
-    let formats = [
-        VideoFormat::BGRx,
-        VideoFormat::BGRA,
-        VideoFormat::RGBx,
-        VideoFormat::RGBA,
+    let mut properties = vec![
+        Property::new(
+            F::MediaType.as_raw(),
+            Value::Id(Id(MediaType::Video.as_raw())),
+        ),
+        Property::new(
+            F::MediaSubtype.as_raw(),
+            Value::Id(Id(MediaSubtype::Raw.as_raw())),
+        ),
+        Property::new(
+            F::VideoFormat.as_raw(),
+            Value::Choice(ChoiceValue::Id(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: Id(formats[0].as_raw()),
+                    alternatives: formats.iter().map(|f| Id(f.as_raw())).collect(),
+                },
+            ))),
+        ),
     ];
+    match mods {
+        Mods::None => {}
+        Mods::Offer(list) => properties.push(Property {
+            key: F::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY
+                | PropertyFlags::from_bits_retain(spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE),
+            value: Value::Choice(ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: list[0] as i64,
+                    alternatives: list.iter().map(|&m| m as i64).collect(),
+                },
+            ))),
+        }),
+        Mods::Fixed(m) => properties.push(Property {
+            key: F::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY,
+            value: Value::Long(m as i64),
+        }),
+    }
+    properties.push(Property::new(
+        F::VideoSize.as_raw(),
+        match fixed {
+            Some((width, height)) => Value::Rectangle(Rectangle { width, height }),
+            None => Value::Choice(ChoiceValue::Rectangle(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: Rectangle {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    min: Rectangle {
+                        width: 1,
+                        height: 1,
+                    },
+                    max: Rectangle {
+                        width: 16384,
+                        height: 16384,
+                    },
+                },
+            ))),
+        },
+    ));
+    properties.push(Property::new(
+        F::VideoFramerate.as_raw(),
+        Value::Choice(ChoiceValue::Fraction(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+                default: Fraction { num: 60, denom: 1 },
+                min: Fraction { num: 0, denom: 1 },
+                max: Fraction { num: 240, denom: 1 },
+            },
+        ))),
+    ));
     serialize(Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
-        properties: vec![
-            Property::new(
-                F::MediaType.as_raw(),
-                Value::Id(Id(MediaType::Video.as_raw())),
-            ),
-            Property::new(
-                F::MediaSubtype.as_raw(),
-                Value::Id(Id(MediaSubtype::Raw.as_raw())),
-            ),
-            Property::new(
-                F::VideoFormat.as_raw(),
-                Value::Choice(ChoiceValue::Id(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Enum {
-                        default: Id(formats[0].as_raw()),
-                        alternatives: formats.iter().map(|f| Id(f.as_raw())).collect(),
-                    },
-                ))),
-            ),
-            Property::new(
-                F::VideoSize.as_raw(),
-                match fixed {
-                    Some((width, height)) => Value::Rectangle(Rectangle { width, height }),
-                    None => Value::Choice(ChoiceValue::Rectangle(Choice(
-                        ChoiceFlags::empty(),
-                        ChoiceEnum::Range {
-                            default: Rectangle {
-                                width: 1920,
-                                height: 1080,
-                            },
-                            min: Rectangle {
-                                width: 1,
-                                height: 1,
-                            },
-                            max: Rectangle {
-                                width: 16384,
-                                height: 16384,
-                            },
-                        },
-                    ))),
-                },
-            ),
-            Property::new(
-                F::VideoFramerate.as_raw(),
-                Value::Choice(ChoiceValue::Fraction(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: Fraction { num: 60, denom: 1 },
-                        min: Fraction { num: 0, denom: 1 },
-                        max: Fraction { num: 240, denom: 1 },
-                    },
-                ))),
-            ),
-        ],
+        properties,
     })
 }
 
-/// Buffers in shared memory only: the CPU path reads them.
+/// The shared-memory form of every layout we accept.
+fn enum_format(fixed: Option<(u32, u32)>) -> Vec<u8> {
+    format_pod(fixed, &SHM_FORMATS, Mods::None)
+}
+
+/// Everything we accept, best first: each layout as a dmabuf with the
+/// modifiers the consumer can import, then shared memory.
+fn enum_formats(fixed: Option<(u32, u32)>, dmabuf: &[(DrmFourcc, Vec<u64>)]) -> Vec<Vec<u8>> {
+    let mut pods: Vec<Vec<u8>> = dmabuf
+        .iter()
+        .filter(|(_, mods)| !mods.is_empty())
+        .filter_map(|(fourcc, mods)| {
+            let format = video_format(*fourcc)?;
+            Some(format_pod(fixed, &[format], Mods::Offer(mods)))
+        })
+        .collect();
+    pods.push(enum_format(fixed));
+    pods
+}
+
+/// The format with the producer's modifier choice settled: what a producer
+/// that hands the choice back (`MODIFIER_FIXATION_REQUIRED`) is answered with.
+/// It picks the first modifier of `param` that the consumer offered.
+fn fixate(
+    param: &Pod,
+    format: VideoFormat,
+    size: (u32, u32),
+    offered: &[u64],
+) -> Result<Vec<u8>, String> {
+    use spa::param::format::FormatProperties as F;
+    use spa::pod::deserialize::PodDeserializer;
+    use spa::pod::ChoiceValue;
+    use spa::utils::ChoiceEnum;
+
+    let (_, value) = PodDeserializer::deserialize_from::<Value>(param.as_bytes())
+        .map_err(|e| format!("read the format: {e:?}"))?;
+    let Value::Object(object) = value else {
+        return Err("the format is not an object".into());
+    };
+    let modifier = object
+        .properties
+        .iter()
+        .find(|p| p.key == F::VideoModifier.as_raw())
+        .ok_or("the format has no modifier")?;
+    let candidates: Vec<u64> = match &modifier.value {
+        Value::Long(m) => vec![*m as u64],
+        Value::Choice(ChoiceValue::Long(choice)) => match &choice.1 {
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => std::iter::once(*default)
+                .chain(alternatives.iter().copied())
+                .map(|m| m as u64)
+                .collect(),
+            ChoiceEnum::None(m) => vec![*m as u64],
+            _ => return Err("an unexpected kind of modifier choice".into()),
+        },
+        _ => return Err("an unexpected kind of modifier value".into()),
+    };
+    let chosen = candidates
+        .iter()
+        .copied()
+        .find(|m| offered.contains(m))
+        .ok_or_else(|| {
+            format!("Mutter offers no modifier we can import (it offered {candidates:x?})")
+        })?;
+    Ok(format_pod(Some(size), &[format], Mods::Fixed(chosen)))
+}
+
+/// Buffers in shared memory: the CPU path reads them.
 fn buffers_param() -> Vec<u8> {
     let types = (1 << spa_sys::SPA_DATA_MemFd) | (1 << spa_sys::SPA_DATA_MemPtr);
     serialize(Object {
@@ -161,6 +278,36 @@ fn buffers_param() -> Vec<u8> {
             spa_sys::SPA_PARAM_BUFFERS_dataType,
             Value::Int(types),
         )],
+    })
+}
+
+/// dmabuf buffers, and a pool big enough that the consumer can hold `held`
+/// frames, one more can be kept for a re-send and one waits for a request,
+/// with some left for the producer to draw into.
+fn dmabuf_buffers_param(held: usize) -> Vec<u8> {
+    use spa::pod::ChoiceValue;
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+    let held = held as i32;
+    serialize(Object {
+        type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![
+            Property::new(
+                spa_sys::SPA_PARAM_BUFFERS_buffers,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: held + 4,
+                        min: held + 3,
+                        max: 16,
+                    },
+                ))),
+            ),
+            Property::new(
+                spa_sys::SPA_PARAM_BUFFERS_dataType,
+                Value::Int(1 << spa_sys::SPA_DATA_DmaBuf),
+            ),
+        ],
     })
 }
 
@@ -208,6 +355,26 @@ struct State {
     fourcc: u32,
     sequence: u64,
     cursor: CursorTracker,
+    /// The stream, to hand dmabuf buffers back to the producer.
+    stream: Option<pw::stream::StreamRc>,
+    /// The pool of dmabuf buffers while Mutter's choice is a dmabuf.
+    dmabuf: Option<Pool>,
+}
+
+/// Mutter's dmabuf buffers, one slot per buffer, in the order they were
+/// added. A slot of the pool is a slot of the pacer.
+struct Pool {
+    modifier: u64,
+    slots: Vec<Slot>,
+}
+
+struct Slot {
+    /// The PipeWire buffer; null once PipeWire removed it.
+    raw: *mut pw::sys::pw_buffer,
+    /// What frames carry, made when the first frame shows the stride.
+    buffer: Option<Arc<CaptureBuffer>>,
+    /// We dequeued it and have not queued it again.
+    outstanding: bool,
 }
 
 impl State {
@@ -220,8 +387,14 @@ impl State {
         self.mainloop.quit();
     }
 
-    /// A new format: a fresh ring, and the consumer learns the size.
-    fn reconfigure(&mut self, size: (u32, u32), fourcc: u32) -> Result<(), String> {
+    /// A new format: a fresh ring (a pool that fills as PipeWire adds its
+    /// buffers, with a modifier), and the consumer learns the size.
+    fn reconfigure(
+        &mut self,
+        size: (u32, u32),
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> Result<(), String> {
         let (w, h) = size;
         if let Some(limit) = self.options.max_size {
             if w > limit.side || h > limit.side || u64::from(w) * u64::from(h) > limit.pixels {
@@ -231,9 +404,23 @@ impl State {
                 ));
             }
         }
+        self.generation += 1;
+        if let Some(modifier) = modifier {
+            // Buffers we held from the old pool are PipeWire's to remove;
+            // frames already sent keep their own handle to the memory.
+            self.ring.clear();
+            self.files.clear();
+            self.dmabuf = Some(Pool {
+                modifier,
+                slots: Vec::new(),
+            });
+            self.pacer.reset(0);
+            self.announce(size, fourcc, modifier);
+            return Ok(());
+        }
+        self.dmabuf = None;
         let stride = w.checked_mul(4).ok_or("stream too wide")?;
         let len = u64::from(stride) * u64::from(h);
-        self.generation += 1;
         let (mut ring, mut files) = (Vec::new(), Vec::new());
         for index in 0..self.options.buffers.max(1) + 1 {
             let fd = memfd_create(c"gliff-gnome", MemfdFlags::CLOEXEC)
@@ -251,6 +438,13 @@ impl State {
         self.pacer.reset(ring.len());
         self.ring = ring;
         self.files = files;
+        self.announce(size, fourcc, MOD_INVALID);
+        Ok(())
+    }
+
+    /// Tell the consumer the stream's size, layout and modifier.
+    fn announce(&mut self, size: (u32, u32), fourcc: u32, modifier: u64) {
+        let (w, h) = size;
         self.size = size;
         self.fourcc = fourcc;
         let output = OutputInfo {
@@ -270,9 +464,8 @@ impl State {
             width: w,
             height: h,
             fourcc,
-            modifier: 0x00ff_ffff_ffff_ffff,
+            modifier,
         });
-        Ok(())
     }
 
     fn send(&mut self, slot: usize) {
@@ -284,8 +477,15 @@ impl State {
             height: h as i32,
         }];
         self.sequence += 1;
+        let buffer = match &self.dmabuf {
+            Some(pool) => pool.slots[slot]
+                .buffer
+                .clone()
+                .expect("a sent slot has a frame"),
+            None => self.ring[slot].clone(),
+        };
         let frame = self.frames.frame(
-            self.ring[slot].clone(),
+            buffer,
             damage,
             self.started.elapsed().as_nanos() as u64,
             self.sequence,
@@ -312,7 +512,127 @@ impl State {
             }
             Cmd::Stop => self.mainloop.quit(),
             // Handled where the stream is; see `run_inner`.
-            Cmd::Resize { .. } => {}
+            Cmd::Resize { .. } | Cmd::UseShm => {}
+        }
+        self.reclaim();
+    }
+
+    /// PipeWire added a buffer to the pool.
+    fn add_buffer(&mut self, raw: *mut pw::sys::pw_buffer) {
+        if let Some(pool) = &mut self.dmabuf {
+            pool.slots.push(Slot {
+                raw,
+                buffer: None,
+                outstanding: false,
+            });
+            self.pacer.add_slot();
+        }
+    }
+
+    /// PipeWire took a buffer out of the pool; it is not ours to queue again.
+    fn remove_buffer(&mut self, raw: *mut pw::sys::pw_buffer) {
+        if let Some(slot) = self
+            .dmabuf
+            .iter_mut()
+            .flat_map(|p| p.slots.iter_mut())
+            .find(|s| s.raw == raw)
+        {
+            slot.raw = std::ptr::null_mut();
+            slot.outstanding = false;
+        }
+    }
+
+    /// Give every buffer nobody needs any more back to the producer.
+    fn reclaim(&mut self) {
+        let (Some(pool), Some(stream)) = (&mut self.dmabuf, &self.stream) else {
+            return;
+        };
+        for (i, slot) in pool.slots.iter_mut().enumerate() {
+            if slot.outstanding && self.pacer.is_free(i) {
+                slot.outstanding = false;
+                // SAFETY: `raw` came from this stream's `dequeue_raw_buffer`
+                // and `remove_buffer` has not reported it gone (it would
+                // have cleared `outstanding`).
+                unsafe { stream.queue_raw_buffer(slot.raw) };
+            }
+        }
+    }
+
+    /// Take every buffer Mutter has ready. Each one with a picture is a new
+    /// frame for the pacer, which keeps the buffer until it is no longer the
+    /// unsent frame, the re-send frame or held by the consumer.
+    fn process_dmabuf(&mut self, stream: &pw::stream::Stream) {
+        loop {
+            // SAFETY: the stream is the one this state belongs to, and the
+            // result is only used until it is queued again.
+            let raw = unsafe { stream.dequeue_raw_buffer() };
+            if raw.is_null() {
+                break;
+            }
+            self.stats.buffers.fetch_add(1, Ordering::Relaxed);
+            self.take(raw, stream);
+        }
+        self.reclaim();
+    }
+
+    fn take(&mut self, raw: *mut pw::sys::pw_buffer, stream: &pw::stream::Stream) {
+        let Some(index) = self
+            .dmabuf
+            .as_ref()
+            .and_then(|p| p.slots.iter().position(|s| s.raw == raw))
+        else {
+            // Not a buffer of this pool (one PipeWire is about to remove).
+            // SAFETY: just dequeued from `stream`.
+            unsafe { stream.queue_raw_buffer(raw) };
+            return;
+        };
+        // SAFETY: a dequeued buffer's `spa_buffer` and its metadata stay
+        // valid until the buffer is queued again, which is after this.
+        let (data, cursor) = unsafe {
+            let spa_buffer = (*raw).buffer;
+            (dmabuf_data(spa_buffer), cursor_meta(spa_buffer))
+        };
+        if let Some(meta) = cursor {
+            self.cursor(meta);
+        }
+        let (generation, size, fourcc) = (self.generation, self.size, self.fourcc);
+        let Some(pool) = &mut self.dmabuf else { return };
+        let modifier = pool.modifier;
+        let slot = &mut pool.slots[index];
+        slot.outstanding = true;
+        let Some(data) = data else {
+            self.stats.empty.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let known = slot.buffer.as_ref().map(|b| b.info.planes[0]);
+        let same = known.is_some_and(|p| p.stride == data.stride && p.offset == data.offset);
+        if known.is_some() && !same {
+            // The import cache is keyed by slot; a buffer that changed its
+            // layout under us cannot be told apart from the old one.
+            tracing::warn!("a dmabuf changed its stride or offset; frame dropped");
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if known.is_none() {
+            // SAFETY: the descriptor belongs to the buffer we hold.
+            let fd = unsafe { BorrowedFd::borrow_raw(data.fd) };
+            let Ok(fd) = fd.try_clone_to_owned() else {
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            slot.buffer = Some(Arc::new(CaptureBuffer::from_dmabuf(
+                index,
+                generation,
+                size,
+                fourcc,
+                modifier,
+                data.offset,
+                data.stride,
+                fd,
+            )));
+        }
+        if let Some(s) = self.pacer.filled(index) {
+            self.send(s);
         }
     }
 
@@ -372,6 +692,67 @@ impl State {
         for event in self.cursor.update((p.x, p.y), sprite) {
             self.emit(event);
         }
+    }
+}
+
+/// Where a dmabuf frame is, as its first data block describes it.
+struct DmabufData {
+    fd: i32,
+    offset: u32,
+    stride: u32,
+}
+
+/// The dmabuf of a buffer that carries a picture. A buffer with no picture (a
+/// cursor-only update: marked corrupted, or no size and no stride) gives
+/// `None`. The chunk size is not required: a dmabuf may leave it 0.
+///
+/// # Safety
+/// `buffer` is null or a valid `spa_buffer` of a dequeued buffer.
+unsafe fn dmabuf_data(buffer: *mut spa_sys::spa_buffer) -> Option<DmabufData> {
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's promise; the datas and chunk pointers are checked.
+    unsafe {
+        let b = &*buffer;
+        if b.n_datas == 0 || b.datas.is_null() {
+            return None;
+        }
+        let d = &*b.datas;
+        if d.type_ != spa_sys::SPA_DATA_DmaBuf || d.chunk.is_null() {
+            return None;
+        }
+        let c = &*d.chunk;
+        let corrupted = c.flags & spa_sys::SPA_CHUNK_FLAG_CORRUPTED as i32 != 0;
+        if corrupted || c.stride <= 0 || d.fd < 0 {
+            return None;
+        }
+        Some(DmabufData {
+            fd: d.fd as i32,
+            offset: c.offset,
+            stride: c.stride as u32,
+        })
+    }
+}
+
+/// The cursor metadata of a buffer, if it has any.
+///
+/// # Safety
+/// `buffer` is null or a valid `spa_buffer`, and the result is not used
+/// after the buffer is queued again.
+unsafe fn cursor_meta<'a>(buffer: *mut spa_sys::spa_buffer) -> Option<&'a MetaCursor> {
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's promise; `MetaCursor` is a transparent wrapper
+    // of `spa_meta_cursor`, which is what is asked for.
+    unsafe {
+        let p = spa_sys::spa_buffer_find_meta_data(
+            buffer,
+            spa_sys::SPA_META_Cursor,
+            std::mem::size_of::<spa_sys::spa_meta_cursor>(),
+        );
+        (!p.is_null()).then(|| &*(p as *const MetaCursor))
     }
 }
 
@@ -471,6 +852,8 @@ fn run_inner(
         fourcc: 0,
         sequence: 0,
         cursor: CursorTracker::new(),
+        stream: Some(stream.clone()),
+        dmabuf: None,
     }));
 
     let _commands = {
@@ -486,13 +869,30 @@ fn run_inner(
             } => {
                 // The scale goes first: Mutter reads it when the format
                 // arrives.
-                let (tag, format) = (scale_tag(scale), enum_format(Some((width, height))));
-                let mut params = [
-                    Pod::from_bytes(&tag).expect("tag pod"),
-                    Pod::from_bytes(&format).expect("format pod"),
-                ];
+                let tag = scale_tag(scale);
+                let formats = enum_formats(Some((width, height)), &st.borrow().options.dmabuf);
+                let mut params = vec![Pod::from_bytes(&tag).expect("tag pod")];
+                params.extend(
+                    formats
+                        .iter()
+                        .map(|f| Pod::from_bytes(f).expect("format pod")),
+                );
                 if let Err(e) = stream.update_params(&mut params) {
                     st.borrow_mut().fail(format!("resize: {e}"));
+                }
+            }
+            // Offer shared memory only from now on; `param_changed` then
+            // builds the memfd ring.
+            Cmd::UseShm => {
+                let size = {
+                    let mut s = st.borrow_mut();
+                    s.options.dmabuf.clear();
+                    (s.size != (0, 0)).then_some(s.size)
+                };
+                let format = enum_format(size);
+                let mut params = [Pod::from_bytes(&format).expect("format pod")];
+                if let Err(e) = stream.update_params(&mut params) {
+                    st.borrow_mut().fail(format!("use shared memory: {e}"));
                 }
             }
             cmd => st.borrow_mut().command(cmd),
@@ -506,8 +906,9 @@ fn run_inner(
                 st.borrow_mut().fail(format!("PipeWire stream error: {e}"));
             }
         })
-        .param_changed(|stream, (st, fmt), id, param| {
+        .param_changed(|stream, (st, _), id, param| {
             let Some(param) = param else { return };
+            let mut fmt = VideoInfoRaw::default();
             if id != spa::param::ParamType::Format.as_raw() || fmt.parse(param).is_err() {
                 return;
             }
@@ -517,14 +918,45 @@ fn run_inner(
                 return;
             };
             let size = fmt.size();
-            let configured = st
-                .borrow_mut()
-                .reconfigure((size.width, size.height), fourcc as u32);
+            let flags = fmt.flags();
+            if flags.contains(VideoFlags::MODIFIER_FIXATION_REQUIRED) {
+                // The producer hands the modifier choice back: answer with
+                // one we offered, and wait for the fixed format.
+                let offered: Vec<u64> = st
+                    .borrow()
+                    .options
+                    .dmabuf
+                    .iter()
+                    .filter(|(f, _)| *f == fourcc)
+                    .flat_map(|(_, m)| m.iter().copied())
+                    .collect();
+                st.borrow().stats.fixations.fetch_add(1, Ordering::Relaxed);
+                match fixate(param, fmt.format(), (size.width, size.height), &offered) {
+                    Ok(pod) => {
+                        let mut params = [Pod::from_bytes(&pod).expect("format pod")];
+                        if let Err(e) = stream.update_params(&mut params) {
+                            st.borrow_mut().fail(format!("fix the modifier: {e}"));
+                        }
+                    }
+                    Err(e) => st.borrow_mut().fail(e),
+                }
+                return;
+            }
+            let modifier = flags.contains(VideoFlags::MODIFIER).then(|| fmt.modifier());
+            let configured =
+                st.borrow_mut()
+                    .reconfigure((size.width, size.height), fourcc as u32, modifier);
             if let Err(e) = configured {
                 st.borrow_mut().fail(e);
                 return;
             }
-            let (b, m) = (buffers_param(), cursor_meta_param());
+            let held = st.borrow().options.buffers.max(1);
+            let b = if modifier.is_some() {
+                dmabuf_buffers_param(held)
+            } else {
+                buffers_param()
+            };
+            let m = cursor_meta_param();
             let mut params = [
                 Pod::from_bytes(&b).expect("buffers pod"),
                 Pod::from_bytes(&m).expect("meta pod"),
@@ -533,7 +965,13 @@ fn run_inner(
                 st.borrow_mut().fail(format!("update_params: {e}"));
             }
         })
+        .add_buffer(|_, (st, _), raw| st.borrow_mut().add_buffer(raw))
+        .remove_buffer(|_, (st, _), raw| st.borrow_mut().remove_buffer(raw))
         .process(|stream, (st, _)| {
+            if st.borrow().dmabuf.is_some() {
+                st.borrow_mut().process_dmabuf(stream);
+                return;
+            }
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -564,9 +1002,12 @@ fn run_inner(
         .register()
         .map_err(|e| err("stream listener")(&e))?;
 
-    let format = enum_format(node_size);
+    let formats = enum_formats(node_size, &state.borrow().options.dmabuf);
     let tag = node_scale.map(scale_tag);
-    let mut params = vec![Pod::from_bytes(&format).expect("format pod")];
+    let mut params: Vec<&Pod> = formats
+        .iter()
+        .map(|f| Pod::from_bytes(f).expect("format pod"))
+        .collect();
     if let Some(tag) = &tag {
         params.insert(0, Pod::from_bytes(tag).expect("tag pod"));
     }
@@ -603,6 +1044,92 @@ mod tests {
             .find(|p| p.key == spa::param::format::FormatProperties::VideoSize.as_raw())
             .expect("a size")
             .value
+    }
+
+    fn object(bytes: &[u8]) -> Object {
+        let (_, value) = PodDeserializer::deserialize_from::<Value>(bytes).expect("parse");
+        let Value::Object(object) = value else {
+            panic!("not an object")
+        };
+        object
+    }
+
+    fn modifier_property(bytes: &[u8]) -> Option<Property> {
+        object(bytes)
+            .properties
+            .into_iter()
+            .find(|p| p.key == spa::param::format::FormatProperties::VideoModifier.as_raw())
+    }
+
+    const TILED: [u64; 3] = [
+        0x0300_0000_0060_6010,
+        0x0300_0000_0060_6011,
+        0x0300_0000_00e0_8010,
+    ];
+
+    #[test]
+    fn offered_modifiers_are_mandatory_and_left_to_the_producer() {
+        let p = modifier_property(&format_pod(None, &[VideoFormat::BGRx], Mods::Offer(&TILED)))
+            .expect("a modifier property");
+        assert!(p.flags.contains(PropertyFlags::MANDATORY));
+        assert!(p.flags.contains(PropertyFlags::from_bits_retain(
+            spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE
+        )));
+        let Value::Choice(spa::pod::ChoiceValue::Long(choice)) = p.value else {
+            panic!("not a long choice")
+        };
+        let spa::utils::ChoiceEnum::Enum {
+            default,
+            alternatives,
+        } = choice.1
+        else {
+            panic!("not an enum")
+        };
+        assert_eq!(default as u64, TILED[0]);
+        assert_eq!(
+            alternatives.iter().map(|&m| m as u64).collect::<Vec<_>>(),
+            TILED
+        );
+    }
+
+    #[test]
+    fn the_shared_memory_form_has_no_modifier() {
+        assert!(modifier_property(&enum_format(None)).is_none());
+    }
+
+    #[test]
+    fn dmabuf_alternatives_come_first_and_a_format_without_modifiers_is_left_out() {
+        let offer = [
+            (DrmFourcc::Xrgb8888, TILED.to_vec()),
+            (DrmFourcc::Argb8888, Vec::new()),
+        ];
+        let pods = enum_formats(None, &offer);
+        assert_eq!(pods.len(), 2, "one dmabuf alternative, then shared memory");
+        assert!(modifier_property(&pods[0]).is_some());
+        assert!(modifier_property(&pods[1]).is_none());
+        assert_eq!(enum_formats(None, &[]).len(), 1);
+    }
+
+    #[test]
+    fn fixating_takes_the_first_modifier_we_offered() {
+        // What Mutter hands back: its own list, in its own order.
+        let theirs = [TILED[2], 0x1234, TILED[1]];
+        let producer = format_pod(
+            Some((1920, 1080)),
+            &[VideoFormat::BGRx],
+            Mods::Offer(&theirs),
+        );
+        let param = Pod::from_bytes(&producer).unwrap();
+        let ours = [TILED[1], TILED[0]];
+        let fixed = fixate(param, VideoFormat::BGRx, (1920, 1080), &ours).expect("a choice");
+        let p = modifier_property(&fixed).unwrap();
+        assert!(matches!(p.value, Value::Long(m) if m as u64 == TILED[1]));
+        assert!(!p.flags.contains(PropertyFlags::from_bits_retain(
+            spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE
+        )));
+        // Nothing in common is an error that says what Mutter offered.
+        let err = fixate(param, VideoFormat::BGRx, (1920, 1080), &[1, 2]).unwrap_err();
+        assert!(err.contains("offers no modifier we can import"), "{err}");
     }
 
     #[test]

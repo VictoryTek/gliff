@@ -194,12 +194,17 @@ pub struct CaptureBuffer {
     backing: Backing,
 }
 
+const NOT_MAPPABLE: &str = "a dmabuf from an external source cannot be read by the CPU";
+
 enum Backing {
     Gbm {
         bo: Mutex<BufferObject<()>>,
         device: Arc<Mutex<Device<File>>>,
     },
     Shm(File),
+    /// A dmabuf another source owns (the GNOME backend's PipeWire buffers):
+    /// the GPU imports it from `info`, and the CPU cannot map it.
+    External,
 }
 
 impl std::fmt::Debug for CaptureBuffer {
@@ -229,6 +234,7 @@ impl CaptureBuffer {
                 file.read_exact_at(&mut pixels, 0)?;
                 return Ok(f(&pixels, stride));
             }
+            Backing::External => return Err(Error::Gbm(NOT_MAPPABLE.into())),
         };
         let device = device
             .lock()
@@ -268,6 +274,7 @@ impl CaptureBuffer {
                 let stride = self.info.planes[0].stride;
                 read_shm_bgra(file, stride, width, height, bgra_in_memory)?
             }
+            Backing::External => return Err(Error::Gbm(NOT_MAPPABLE.into())),
             Backing::Gbm { .. } => self.with_mapped(|mapped, stride| {
                 let mut out = vec![0u8; width * height * 4];
                 for (dst, src) in out

@@ -43,6 +43,38 @@ impl CaptureBuffer {
     }
 }
 
+impl CaptureBuffer {
+    /// A buffer that is a dmabuf some other source owns, described by the
+    /// source: `fd` is our own handle to it. The GPU imports it with
+    /// `modifier`, `offset` and `stride`; the CPU cannot map it (`is_shm` is
+    /// false and `read_bgra` fails).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_dmabuf(
+        index: usize,
+        generation: u64,
+        (width, height): (u32, u32),
+        fourcc: u32,
+        modifier: u64,
+        offset: u32,
+        stride: u32,
+        fd: std::os::fd::OwnedFd,
+    ) -> Self {
+        Self {
+            index,
+            generation,
+            info: DmabufInfo {
+                fd,
+                width,
+                height,
+                fourcc,
+                modifier,
+                planes: vec![Plane { offset, stride }],
+            },
+            backing: Backing::External,
+        }
+    }
+}
+
 /// Makes [`CapturedFrame`]s whose release is reported to a callback.
 ///
 /// Dropping a frame calls `on_release(index, generation)` of its buffer, from

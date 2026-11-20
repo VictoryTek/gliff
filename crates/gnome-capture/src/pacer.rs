@@ -37,6 +37,17 @@ impl Pacer {
         };
     }
 
+    /// One more slot (a dmabuf pool grows one buffer at a time).
+    pub(crate) fn add_slot(&mut self) {
+        self.held.push(0);
+    }
+
+    /// No consumer holds `slot`, and it is neither the unsent frame nor the
+    /// one kept for a re-send: its buffer can go back to the producer.
+    pub(crate) fn is_free(&self, slot: usize) -> bool {
+        self.held.get(slot) == Some(&0) && self.pending != Some(slot) && self.last != Some(slot)
+    }
+
     /// A slot to write the next frame into, or `None` when the consumer holds
     /// every slot (the frame is dropped). The newest frame wins: with nothing
     /// else free, the slot of an unsent frame is overwritten (that frame is
@@ -118,6 +129,37 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_is_free_once_it_is_neither_held_pending_nor_last() {
+        let mut p = Pacer::new(0);
+        p.add_slot();
+        p.add_slot();
+        // Frame in slot 0 arrives, is sent, then slot 1 arrives and replaces
+        // it as the newest.
+        assert_eq!(p.filled(0), None);
+        assert!(!p.is_free(0), "unsent");
+        assert_eq!(p.request(), Some(0));
+        assert!(!p.is_free(0), "held and last");
+        p.release(0);
+        assert!(!p.is_free(0), "still the one kept for a re-send");
+        assert_eq!(p.filled(1), None);
+        assert_eq!(p.request(), Some(1));
+        p.release(1);
+        assert!(p.is_free(0), "a newer frame was sent, so 0 can go back");
+        assert!(!p.is_free(1));
+    }
+
+    #[test]
+    fn an_unsent_frame_replaced_by_a_newer_one_is_free() {
+        let mut p = Pacer::new(0);
+        p.add_slot();
+        p.add_slot();
+        assert_eq!(p.filled(0), None);
+        assert_eq!(p.filled(1), None);
+        assert!(p.is_free(0), "never sent, and no longer the newest");
+        assert!(!p.is_free(1));
+    }
 
     #[test]
     fn a_frame_waits_for_a_request() {

@@ -54,7 +54,7 @@ rustPlatform.buildRustPackage {
   # fixup phase would drop. Link it for real on the actual executables (the
   # GApps hook has already turned bin/<name> into a wrapper script).
   postFixup = ''
-    for bin in gliff gliff-server gliff-probe; do
+    for bin in gliff gliff-server gliff-probe gliff-gnome-dmabuf-probe; do
       patchelf --add-needed libvulkan.so.1 --add-rpath ${lib.makeLibraryPath [ vulkan-loader ]} "$out/bin/.$bin-wrapped"
     done
   '';

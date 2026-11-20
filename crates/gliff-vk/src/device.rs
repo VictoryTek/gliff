@@ -399,6 +399,47 @@ impl Gpu {
         }
     }
 
+    /// The modifiers a captured single-plane dmabuf of `fourcc` can have and
+    /// still be imported by the capture path (`Image::import_dmabuf`): the ones the
+    /// driver lists for the matching Vulkan format with one memory plane and
+    /// sampling. A producer that picks its own modifier (PipeWire) is offered
+    /// this list. Empty for a format the capture path does not take.
+    pub fn dmabuf_modifiers(&self, fourcc: drm_fourcc::DrmFourcc) -> Vec<u64> {
+        use drm_fourcc::DrmFourcc;
+        // The same mapping as the dmabuf import.
+        let format = match fourcc {
+            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
+            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => vk::Format::R8G8B8A8_UNORM,
+            _ => return Vec::new(),
+        };
+        // SAFETY: two-call pattern on a valid physical device; the list is
+        // sized from the first call before the second fills it.
+        unsafe {
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            let mut entries = vec![
+                vk::DrmFormatModifierPropertiesEXT::default();
+                list.drm_format_modifier_count as usize
+            ];
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut entries);
+            let mut props = vk::FormatProperties2::default().push_next(&mut list);
+            self.instance
+                .get_physical_device_format_properties2(self.physical, format, &mut props);
+            entries
+                .iter()
+                .filter(|e| {
+                    e.drm_format_modifier_plane_count == 1
+                        && e.drm_format_modifier_tiling_features
+                            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                })
+                .map(|e| e.drm_format_modifier)
+                .collect()
+        }
+    }
+
     /// Wait for the whole device to go idle (teardown, resize).
     pub fn wait_idle(&self) {
         // SAFETY: valid device.

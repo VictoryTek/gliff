@@ -39,8 +39,10 @@ has a PipeWire node; it does not read frames.
 ## `gnome-capture`
 
 `crates/gnome-capture` reads a stream's frames from PipeWire and emits the
-same capture events as the Hyprland capturer. Frames are in shared memory
-(CPU-readable only); dmabuf comes later. Check it with:
+same capture events as the Hyprland capturer. By default frames are in shared
+memory (CPU-readable); with `Options::dmabuf` set (the modifiers the GPU can
+import) Mutter's own buffers are handed on as dmabufs for the GPU encoder, and
+`Capturer::use_shm` goes back to shared memory. Check it with:
 
 ```
 gliff-gnome-capture-probe --png frame.png     # capture the primary monitor
@@ -51,6 +53,18 @@ gliff-gnome-capture-probe --cursor embedded   # cursor painted into the frames
 The probe reports the frame size, whether the pixels are real, the frame rate,
 whether a recapture works and what the cursor did; `--png` saves the first
 frame so it can be looked at.
+
+The dmabuf path needs a GPU, so it has its own probe in `gnome-backend`:
+
+```
+gliff-gnome-dmabuf-probe --connector HDMI-1 --secs 5 --move   # a monitor; the cursor moves so the screen changes
+gliff-gnome-dmabuf-probe --virtual                            # a virtual monitor, resized through three sizes
+```
+
+It prints which modifiers Vulkan can import and which Mutter chose, encodes
+every frame on the GPU, compares the decoded picture with a shared-memory
+capture (monitor mode), and checks that `use_shm` works. The screen must be
+free to use while it runs; it wakes the screen and keeps it awake.
 
 ## `gnome-input`
 

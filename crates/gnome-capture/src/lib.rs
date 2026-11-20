@@ -5,7 +5,9 @@
 //! [`CaptureEvent`]s the Hyprland capturer does. Frames are copied out of
 //! PipeWire into a small ring of memfd buffers, so a PipeWire buffer is
 //! returned at once and the consumer can hold a frame as long as it likes.
-//! They are CPU-readable only; zero-copy dmabuf capture is a later step.
+//! Those copies are CPU-readable. With [`Options::dmabuf`] set the stream is offered
+//! as a dmabuf first, and Mutter's buffers are handed on as they are: the GPU
+//! imports them, the CPU cannot read them.
 
 mod cursor;
 mod output;
@@ -42,6 +44,11 @@ pub struct Options {
     pub size: Option<(u32, u32)>,
     /// Ask for this scale from the start (a virtual monitor only).
     pub scale: Option<f64>,
+    /// The modifiers the consumer can import for each DRM format. With any,
+    /// the stream is offered as a dmabuf first and Mutter may pick one of
+    /// these; without, or when Mutter picks none, frames come in shared
+    /// memory. [`Capturer::use_shm`] drops the offer.
+    pub dmabuf: Vec<(drm_fourcc::DrmFourcc, Vec<u64>)>,
 }
 
 impl Options {
@@ -54,6 +61,7 @@ impl Options {
             max_size: None,
             size: None,
             scale: None,
+            dmabuf: Vec::new(),
         }
     }
 }
@@ -70,6 +78,9 @@ pub struct Stats {
     pub dropped: AtomicU64,
     /// Buffers that carried a cursor update (an id of 0 means none).
     pub cursor_meta: AtomicU64,
+    /// Times Mutter handed the modifier choice back and we made it (0 when
+    /// Mutter fixes the modifier itself).
+    pub fixations: AtomicU64,
 }
 
 impl Stats {
@@ -83,6 +94,7 @@ pub(crate) enum Cmd {
     Recapture,
     Release { index: usize, generation: u64 },
     Resize { width: u32, height: u32, scale: f64 },
+    UseShm,
     Stop,
 }
 
@@ -142,6 +154,12 @@ impl Capturer {
             height,
             scale,
         })
+    }
+
+    /// Stop offering dmabufs and renegotiate to shared memory, for a consumer
+    /// that cannot import them. The choice stays across later resizes.
+    pub fn use_shm(&self) -> Result<()> {
+        self.send(Cmd::UseShm)
     }
 
     pub fn stats(&self) -> &Stats {

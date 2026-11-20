@@ -1107,9 +1107,12 @@ version = "0.4.3"
 dependencies = [
  "anyhow",
  "bytes",
+ "drm-fourcc",
  "gliff-backend",
  "gliff-proto",
+ "gliff-sw",
  "gliff-transport",
+ "gliff-vk",
  "gnome-capture",
  "gnome-clipboard",
  "gnome-input",
@@ -1130,6 +1133,7 @@ dependencies = [
  "pipewire",
  "png",
  "rustix 1.1.4",
+ "tracing",
 ]
 
 [[package]]
