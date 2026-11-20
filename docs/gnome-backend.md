@@ -122,9 +122,15 @@ virtual monitor is always scale 1.
 ## Running the server on GNOME
 
 `gliff-server` picks Hyprland when an instance is running and GNOME otherwise
-(`crates/gliff-server/src/backend.rs`); nothing needs to be configured. It
-runs with the CPU video pipeline, because capture is shared memory only until
-dmabuf capture exists. A mirrored session (the default) shows the real screen;
+(`crates/gliff-server/src/backend.rs`); nothing needs to be configured. On a
+machine with a GPU the server uses the GPU video pipeline and Mutter's frames
+reach it as dmabufs; with `--video cpu`, `--capture shm`, or no usable GPU it
+uses the CPU pipeline and shared memory. If the first GPU encode fails (say the
+dmabuf comes from another GPU than the one the server encodes on), the server
+falls back to the CPU pipeline by itself. A headless session is first offered
+dmabufs for the render node the server would pick by default
+(`GLIFF_RENDER_NODE`, else `renderD128`); with a different `--render-node` the
+GPU path may fail and fall back as just described. A mirrored session (the default) shows the real screen;
 `--headless` creates a private screen the size of the viewer's window, which
 lives as long as the session. To check the whole path without a viewer, run
 this on the GNOME machine:
@@ -138,8 +144,9 @@ gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application 
 ```
 
 `serve_probe` is a headless gliff client: it checks the greeting, the first
-frame, the new monitor, the pointer, the cursor shape, resizes and that the
-monitors are back to normal afterwards. It does not decode video.
+frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor, the
+pointer, the cursor shape, resizes and that the monitors are back to normal
+afterwards. It does not decode video.
 
 ## The viewer on GNOME
 

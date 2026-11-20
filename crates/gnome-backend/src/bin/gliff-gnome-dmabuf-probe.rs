@@ -315,6 +315,15 @@ fn drive(
 /// After `use_shm`: the stream comes back as shared memory, and a frame of it
 /// can be read by the CPU.
 fn check_shm(cap: &Capturer, rx: &mpsc::Receiver<CaptureEvent>) -> bool {
+    // Use up the pending request first, as the server's is when its first GPU
+    // encode fails: after `use_shm` a frame must arrive without asking.
+    let _ = cap.request_frame();
+    let used = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < used {
+        if let Ok(CaptureEvent::Frame(_)) = rx.recv_timeout(Duration::from_millis(200)) {
+            break;
+        }
+    }
     if let Err(e) = cap.use_shm() {
         return fail("use_shm", e);
     }
@@ -342,12 +351,8 @@ fn check_shm(cap: &Capturer, rx: &mpsc::Receiver<CaptureEvent>) -> bool {
                 };
             }
             Ok(CaptureEvent::Error(e)) => return fail("use_shm", e),
-            // Dmabuf frames still in flight, or a quiet screen.
-            Ok(_) => {}
-            Err(_) => {
-                let _ = cap.request_frame();
-                let _ = cap.recapture();
-            }
+            // Dmabuf frames still in flight.
+            Ok(_) | Err(_) => {}
         }
     }
     fail("use_shm", "no shared-memory frame in 5 s")

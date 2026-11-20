@@ -44,6 +44,7 @@ fn create_at(
         size,
         scale,
         CursorMode::Metadata,
+        Vec::new(),
         Box::new(move |ev| {
             let _ = tx.send(ev);
         }),

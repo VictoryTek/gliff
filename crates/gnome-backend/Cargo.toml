@@ -19,6 +19,7 @@ gnome-capture = { path = "../gnome-capture" }
 gnome-clipboard = { path = "../gnome-clipboard" }
 gnome-input = { path = "../gnome-input" }
 gnome-ipc = { path = "../gnome-ipc" }
+hypr-capture.workspace = true
 tracing.workspace = true
 zbus = "5"
 

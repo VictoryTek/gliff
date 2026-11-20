@@ -48,6 +48,18 @@ impl Pacer {
         self.held.get(slot) == Some(&0) && self.pending != Some(slot) && self.last != Some(slot)
     }
 
+    /// Forget the unsent frame and the one kept for a re-send, for a stream
+    /// whose buffers are about to be replaced by ones the consumer cannot
+    /// use. Frames already sent stay with the consumer. The consumer is owed
+    /// a frame afterwards: it either still waits for one, or the frame it
+    /// asked for was one of these and it will not ask again, so the next
+    /// frame goes out without a request.
+    pub(crate) fn forget_frames(&mut self) {
+        self.pending = None;
+        self.last = None;
+        self.wanted = true;
+    }
+
     /// A slot to write the next frame into, or `None` when the consumer holds
     /// every slot (the frame is dropped). The newest frame wins: with nothing
     /// else free, the slot of an unsent frame is overwritten (that frame is
@@ -148,6 +160,36 @@ mod tests {
         p.release(1);
         assert!(p.is_free(0), "a newer frame was sent, so 0 can go back");
         assert!(!p.is_free(1));
+    }
+
+    #[test]
+    fn forgetting_frames_frees_the_unsent_and_the_resend_slots_but_not_held_ones() {
+        let mut p = Pacer::new(0);
+        p.add_slot();
+        p.add_slot();
+        assert_eq!(p.filled(0), None);
+        assert_eq!(p.request(), Some(0)); // sent: held, and the re-send frame
+        assert_eq!(p.filled(1), None); // unsent
+        p.forget_frames();
+        assert!(!p.is_free(0), "the consumer still holds it");
+        assert!(p.is_free(1));
+        p.release(0);
+        assert!(p.is_free(0));
+        assert_eq!(p.recapture(), None, "nothing to send again");
+        // The request the discarded frame answered is not asked again: the
+        // next frame still goes out.
+        let mut q = Pacer::new(0);
+        q.add_slot();
+        assert_eq!(q.filled(0), None);
+        assert_eq!(q.request(), Some(0));
+        q.forget_frames();
+        q.release(0);
+        q.add_slot();
+        assert_eq!(
+            q.filled(1),
+            Some(1),
+            "owed a frame, so no request is needed"
+        );
     }
 
     #[test]

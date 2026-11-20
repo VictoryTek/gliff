@@ -570,6 +570,14 @@ impl State {
                 break;
             }
             self.stats.buffers.fetch_add(1, Ordering::Relaxed);
+            if self.options.dmabuf.is_empty() {
+                // Shared memory was asked for ([`Cmd::UseShm`]); these are the
+                // old buffers, still arriving while the format changes, and
+                // the consumer cannot read them.
+                // SAFETY: just dequeued from `stream`.
+                unsafe { stream.queue_raw_buffer(raw) };
+                continue;
+            }
             self.take(raw, stream);
         }
         self.reclaim();
@@ -887,6 +895,16 @@ fn run_inner(
                 let size = {
                     let mut s = st.borrow_mut();
                     s.options.dmabuf.clear();
+                    // Already shared memory: nothing to renegotiate.
+                    if s.dmabuf.is_none() && s.size != (0, 0) {
+                        return;
+                    }
+                    // Frames of the old buffers must not reach a consumer
+                    // that cannot read them.
+                    if s.dmabuf.is_some() {
+                        s.pacer.forget_frames();
+                        s.reclaim();
+                    }
                     (s.size != (0, 0)).then_some(s.size)
                 };
                 let format = enum_format(size);

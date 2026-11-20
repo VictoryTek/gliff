@@ -11,8 +11,16 @@
 //! * Input needs the session and stream of the capture, so `start_input`
 //!   finds them by output name. The server starts the capture first.
 //!
-//! Capture is shared memory only for now, so [`Backend::forced_capture_mode`]
-//! asks the server for the CPU pipeline.
+//! Capture is a dmabuf for the GPU pipeline when the server wants one and
+//! Vulkan on its render node can import what Mutter offers, and shared memory
+//! otherwise (the CPU pipeline, `--capture shm`, or after the server's
+//! `use_shm`). A virtual output starts capturing before the server says which,
+//! so it starts as a dmabuf on the render node the server would pick by
+//! default (`GLIFF_RENDER_NODE`, else `renderD128`) and `start_capture` switches
+//! it to shared memory when the server needs that. A server run with another
+//! `--render-node` on a headless GNOME session may meet a dmabuf its GPU cannot
+//! import; its first GPU encode then fails and it falls back to the CPU
+//! pipeline by itself.
 
 mod forward;
 
@@ -23,13 +31,16 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use drm_fourcc::DrmFourcc;
 use gliff_backend::{
     AwakeCheck, Backend, CaptureConfig, CaptureControl, CaptureMode, CaptureSink, ClipboardControl,
     ClipboardSink, CreateError, InputCmd, InputConfig, InputControl, OutputInfo,
 };
+use gliff_vk::Gpu;
 use gnome_capture::{Capturer, Options, VirtualOutput};
 use gnome_ipc::power::{self, IdleInhibitor};
 use gnome_ipc::{mutter, CursorMode, GraphicalSession, Monitor, Session, Stream, StreamSource};
+use std::path::{Path, PathBuf};
 use zbus::blocking::Connection;
 
 use forward::Forward;
@@ -37,10 +48,18 @@ use forward::Forward;
 /// The size a virtual output starts at; the server resizes it at once.
 const FIRST_SIZE: (u32, u32) = (1920, 1080);
 
+/// What a stream offers Mutter: the modifiers the GPU can import per format.
+type Offer = Vec<(DrmFourcc, Vec<u64>)>;
+
 pub struct GnomeBackend {
     desktop: GraphicalSession,
     conn: Connection,
     outputs: Mutex<HashMap<String, Slot>>,
+    /// The render node a virtual output is offered dmabufs for, before the
+    /// server says which it uses.
+    default_node: PathBuf,
+    /// What Vulkan said for each render node asked about.
+    offers: Mutex<HashMap<PathBuf, Offer>>,
 }
 
 enum Slot {
@@ -115,11 +134,43 @@ impl GnomeBackend {
         let conn = mutter::connect(&desktop.bus_address)?;
         let (rd, sc) = mutter::versions(&conn)?;
         tracing::info!(remote_desktop = rd, screen_cast = sc, "GNOME session found");
+        let default_node = std::env::var_os("GLIFF_RENDER_NODE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(hypr_capture::DEFAULT_RENDER_NODE));
         Ok(Self {
             desktop,
             conn,
             outputs: Mutex::new(HashMap::new()),
+            default_node,
+            offers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The modifiers Vulkan on `node` can import, for each format Mutter may
+    /// use; empty when there is no such GPU. Asked once per node.
+    fn dmabuf_offer(&self, node: &Path) -> Offer {
+        let mut offers = self.offers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(offer) = offers.get(node) {
+            return offer.clone();
+        }
+        let offer = match Gpu::open(Some(node)) {
+            Ok(gpu) => [
+                DrmFourcc::Xrgb8888,
+                DrmFourcc::Argb8888,
+                DrmFourcc::Xbgr8888,
+                DrmFourcc::Abgr8888,
+            ]
+            .into_iter()
+            .map(|f| (f, gpu.dmabuf_modifiers(f)))
+            .filter(|(_, mods)| !mods.is_empty())
+            .collect(),
+            Err(e) => {
+                tracing::info!(node = %node.display(), error = %e, "no GPU to import dmabufs; capturing to shared memory");
+                Vec::new()
+            }
+        };
+        offers.insert(node.to_path_buf(), offer.clone());
+        offer
     }
 
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
@@ -186,8 +237,16 @@ impl Backend for GnomeBackend {
                     .event(event)
             })
         };
-        let out = VirtualOutput::create(&self.desktop, FIRST_SIZE, 1.0, CursorMode::Metadata, sink)
-            .map_err(fail)?;
+        let offer = self.dmabuf_offer(&self.default_node);
+        let out = VirtualOutput::create(
+            &self.desktop,
+            FIRST_SIZE,
+            1.0,
+            CursorMode::Metadata,
+            offer,
+            sink,
+        )
+        .map_err(fail)?;
         tracing::info!(name, connector = out.connector(), "virtual output created");
         self.slots().insert(
             name.to_string(),
@@ -256,17 +315,31 @@ impl Backend for GnomeBackend {
         sink: CaptureSink,
     ) -> Result<Box<dyn CaptureControl>> {
         let name = config.output.clone();
+        // The CPU pipeline cannot read a dmabuf; the server says so with
+        // `--capture shm` or by allowing the shared-memory fallback.
+        let needs_shm = config.mode == CaptureMode::Shm || config.shm_fallback;
         if let Some(held) = self.held(&name) {
             if let Held::Virtual(v) = &held {
                 v.forward
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .attach(sink);
+                if needs_shm {
+                    held.capturer().use_shm()?;
+                }
                 return Ok(Box::new(GnomeCapture(held)));
             }
         }
-        if config.mode == CaptureMode::Dmabuf {
-            bail!("dmabuf capture is not available on GNOME yet (use --capture auto or shm)");
+        let offer = if needs_shm {
+            Offer::new()
+        } else {
+            self.dmabuf_offer(&config.render_node)
+        };
+        if config.mode == CaptureMode::Dmabuf && !needs_shm && offer.is_empty() {
+            bail!(
+                "dmabuf capture needs a GPU Vulkan can import from; none on {}",
+                config.render_node.display()
+            );
         }
         let monitors = mutter::monitors(&self.conn)?;
         let monitor = monitors
@@ -288,6 +361,7 @@ impl Backend for GnomeBackend {
         let mut options = Options::new(node, &self.desktop.runtime_dir, name.clone());
         options.buffers = config.buffers;
         options.max_size = config.max_size;
+        options.dmabuf = offer;
         let capturer = Capturer::start(options, sink)?;
         let mirror = Arc::new(Mirror {
             connector: monitor.connector.clone(),
@@ -325,10 +399,6 @@ impl Backend for GnomeBackend {
             sink,
         )?)))
     }
-
-    fn forced_capture_mode(&self) -> Option<CaptureMode> {
-        Some(CaptureMode::Shm)
-    }
 }
 
 struct GnomeCapture(Held);
@@ -340,9 +410,8 @@ impl CaptureControl for GnomeCapture {
     fn recapture(&self) -> Result<()> {
         self.0.capturer().recapture()
     }
-    /// Capture is already shared memory.
     fn use_shm(&self) -> Result<()> {
-        Ok(())
+        self.0.capturer().use_shm()
     }
 }
 

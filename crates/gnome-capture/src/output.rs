@@ -53,12 +53,14 @@ impl VirtualOutput {
     /// Create a virtual monitor of `size`, at `scale` if Mutter supports it. A blanked screen is woken first
     /// (Mutter refuses new sessions on a blanked screen) and the desktop is
     /// kept from going idle until the output is dropped. Capture events go to
-    /// `sink` from the start, the first `Ready` included.
+    /// `sink` from the start, the first `Ready` included. `dmabuf` is the
+    /// stream's [`Options::dmabuf`]: empty for shared memory.
     pub fn create(
         desktop: &GraphicalSession,
         size: (u32, u32),
         scale: f64,
         cursor: CursorMode,
+        dmabuf: Vec<(drm_fourcc::DrmFourcc, Vec<u64>)>,
         sink: EventSink,
     ) -> Result<Self> {
         let conn = mutter::connect(&desktop.bus_address)?;
@@ -74,6 +76,7 @@ impl VirtualOutput {
         let mut options = Options::new(node, &desktop.runtime_dir, "virtual");
         options.size = Some(size);
         options.scale = Some(scale);
+        options.dmabuf = dmabuf;
         let capturer = Capturer::start(options, sink)?;
 
         // The monitor appears once the stream has a format. Name it by what
