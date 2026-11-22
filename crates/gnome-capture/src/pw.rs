@@ -192,6 +192,18 @@ fn format_pod(fixed: Option<(u32, u32)>, formats: &[VideoFormat], mods: Mods) ->
             },
         ))),
     ));
+    // Mutter skips a frame that comes sooner than 1/max_framerate after the
+    // last one, and for a monitor it offers a maximum equal to the monitor's
+    // refresh rate (0 to 60 here), whose default it keeps when we offer
+    // nothing. On a 60 Hz monitor, timestamp jitter then drops about a third
+    // of the frames (seen: 38 to 40 of 59 a second). Zero means no limit.
+    // Needs a Mutter whose monitor offer starts at 0 (50.6 does; 46 starts at
+    // 1, where a fixed 0 would leave nothing in common and capture would
+    // not start). This backend is only tested on 50.6.
+    properties.push(Property::new(
+        F::VideoMaxFramerate.as_raw(),
+        Value::Fraction(Fraction { num: 0, denom: 1 }),
+    ));
     serialize(Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -1048,7 +1060,7 @@ fn run_inner(
 mod tests {
     use super::*;
     use spa::pod::deserialize::PodDeserializer;
-    use spa::utils::Rectangle;
+    use spa::utils::{Fraction, Rectangle};
 
     /// The `VideoSize` property of a serialized format.
     fn video_size(bytes: &[u8]) -> Value {
@@ -1148,6 +1160,29 @@ mod tests {
         // Nothing in common is an error that says what Mutter offered.
         let err = fixate(param, VideoFormat::BGRx, (1920, 1080), &[1, 2]).unwrap_err();
         assert!(err.contains("offers no modifier we can import"), "{err}");
+    }
+
+    #[test]
+    fn every_form_asks_for_no_frame_rate_limit() {
+        // Mutter limits a monitor stream to the maximum it settles on, which
+        // is its own offer (the refresh rate) unless we name one; zero is
+        // the only value it does not limit by. Shared memory and dmabuf alike.
+        let offer = [(DrmFourcc::Xrgb8888, TILED.to_vec())];
+        let mut forms = enum_formats(None, &offer);
+        forms.push(enum_format(Some((1280, 720))));
+        assert_eq!(forms.len(), 3);
+        for form in forms {
+            let max = object(&form)
+                .properties
+                .into_iter()
+                .find(|p| p.key == spa::param::format::FormatProperties::VideoMaxFramerate.as_raw())
+                .expect("a max frame rate")
+                .value;
+            assert!(
+                matches!(max, Value::Fraction(Fraction { num: 0, denom: 1 })),
+                "{max:?}"
+            );
+        }
     }
 
     #[test]

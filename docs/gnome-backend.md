@@ -54,6 +54,17 @@ The probe reports the frame size, whether the pixels are real, the frame rate,
 whether a recapture works and what the cursor did; `--png` saves the first
 frame so it can be looked at.
 
+The format we offer names a maximum frame rate of 0, which Mutter reads as no
+limit. Without it Mutter skips any frame that comes less than 1/maximum after
+the last one, and for a monitor its own maximum is the monitor's refresh rate,
+which on a 60 Hz monitor cost about a third of the frames (38 to 40 of 59 a
+second, seen on the NVIDIA desktop; see "A changing screen and a client that
+stops reading, on GNOME" in `docs/PLAN.md`). A monitor now streams at the
+display's rate (59.4 a second measured on a 60 Hz monitor). This needs a
+Mutter whose monitor offer allows 0 (50.6 does; 46 starts at 1, so there a
+fixed 0 would leave nothing in common and capture would not start); only 50.6
+has been tested.
+
 The dmabuf path needs a GPU, so it has its own probe in `gnome-backend`:
 
 ```
@@ -195,7 +206,9 @@ applications (it replaces the desktop's clipboard while it runs):
 serve_probe target/debug/gliff-server --headless --rich-clipboard
 ```
 
-`--load SECS` (on a mirrored screen, with `gliff-gnome-animate` running on it)
+`--load SECS` (on a mirrored screen, with `gliff-gnome-animate` running on it;
+the animation prints how many frames it painted and how many the compositor
+reported as presented, which is what the screen really showed)
 reads the stream while the picture changes all the time and reports frames per
 second, bytes a frame, the longest gap and the server's CPU and memory;
 `--stall SECS` adds a stretch where the client stops reading, and checks that

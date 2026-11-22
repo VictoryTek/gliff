@@ -6,16 +6,72 @@
 //!                                 run for SECS seconds (default 60), drawing
 //!                                 RECTS coloured rectangles a frame (default
 //!                                 300), then print how many frames it drew
+//!                                 and how many of them the compositor
+//!                                 reported as presented
 //!
 //! It draws the rectangles and a sweeping bar per frame, so the picture is
 //! busy enough to need real bit rate from the encoder. More rectangles cost
 //! the test window itself more time: with few, it keeps up with the display.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
+
+/// What the frame clock says about frames after they were drawn. On Wayland
+/// the presentation time comes from the compositor's feedback for each
+/// committed frame, so distinct times count what it really put on screen.
+#[derive(Default)]
+struct Presented {
+    /// The next frame counter to look at.
+    next: i64,
+    /// Frames with a presentation time that differs from the one before.
+    shown: u32,
+    /// Frames complete but without a presentation time.
+    untimed: u32,
+    /// Frames not yet complete when they were looked at (three behind the
+    /// clock), and not looked at again.
+    open: u32,
+    last: i64,
+    /// Microseconds between consecutive distinct presentation times.
+    gaps: Vec<i64>,
+    /// Microseconds between refreshes, as the clock last reported.
+    refresh: i64,
+}
+
+impl Presented {
+    /// Look at every frame at least three behind the clock's current one.
+    fn update(&mut self, clock: &gtk4::gdk::FrameClock) {
+        let upto = clock.frame_counter() - 3;
+        if self.next == 0 {
+            self.next = upto.max(1);
+        }
+        while self.next <= upto {
+            if let Some(t) = clock.timings(self.next) {
+                if !t.is_complete() {
+                    self.open += 1;
+                } else if t.presentation_time() == 0 {
+                    self.untimed += 1;
+                } else if t.presentation_time() != self.last {
+                    if self.last != 0 {
+                        self.gaps.push(t.presentation_time() - self.last);
+                    }
+                    self.last = t.presentation_time();
+                    self.shown += 1;
+                    self.refresh = t.refresh_interval();
+                }
+            }
+            self.next += 1;
+        }
+    }
+
+    fn median_gap_ms(&self) -> f64 {
+        let mut g = self.gaps.clone();
+        g.sort_unstable();
+        g.get(g.len() / 2).map_or(0.0, |&u| u as f64 / 1000.0)
+    }
+}
 
 /// A cheap deterministic stream of numbers for the picture.
 fn next(x: &mut u32) -> f64 {
@@ -37,10 +93,13 @@ fn main() {
         std::process::exit(1);
     }
     let frame = Rc::new(Cell::new(0u32));
+    let paints = Rc::new(Cell::new(0u32));
+    let presented = Rc::new(RefCell::new(Presented::default()));
     let area = gtk4::DrawingArea::new();
     {
-        let frame = frame.clone();
+        let (frame, paints) = (frame.clone(), paints.clone());
         area.set_draw_func(move |_, cr, w, h| {
+            paints.set(paints.get() + 1);
             let n = frame.get();
             let (w, h) = (f64::from(w), f64::from(h));
             cr.set_source_rgb(0.08, 0.08, 0.1);
@@ -64,9 +123,10 @@ fn main() {
         });
     }
     area.add_tick_callback({
-        let frame = frame.clone();
-        move |area, _| {
+        let (frame, presented) = (frame.clone(), presented.clone());
+        move |area, clock| {
             frame.set(frame.get().wrapping_add(1));
+            presented.borrow_mut().update(clock);
             area.queue_draw();
             gtk4::glib::ControlFlow::Continue
         }
@@ -92,9 +152,20 @@ fn main() {
     main_loop.run();
     let n = frame.get();
     window.close();
+    let secs = started.elapsed().as_secs_f64();
     println!(
-        "drew {n} frames in {:.1} s ({:.1} per second)",
-        started.elapsed().as_secs_f64(),
-        f64::from(n) / started.elapsed().as_secs_f64()
+        "drew {n} frames in {secs:.1} s ({:.1} per second)",
+        f64::from(n) / secs
+    );
+    let p = presented.borrow();
+    println!(
+        "painted {} times; the compositor presented {} ({:.1} per second), {} had no presentation time, {} incomplete when looked at; median gap {:.1} ms (refresh interval {:.1} ms)",
+        paints.get(),
+        p.shown,
+        f64::from(p.shown) / secs,
+        p.untimed,
+        p.open,
+        p.median_gap_ms(),
+        p.refresh as f64 / 1000.0
     );
 }
