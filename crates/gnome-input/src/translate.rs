@@ -922,6 +922,42 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_is_tab_with_our_shift_and_leaves_nothing_behind() {
+        // ISO_Left_Tab would get a Shift from Mutter that outlives ours.
+        const KEY_TAB: u32 = 15;
+        let mut us = with("us");
+        key(&mut us, KEY_LEFTSHIFT, true);
+        assert_eq!(
+            key(&mut us, KEY_TAB, true),
+            [sym(SHIFT_L, true), sym(0xff09, true)]
+        );
+        key(&mut us, KEY_LEFTSHIFT, false);
+        // Tab is still down; the next character first lets go of nothing
+        // Mutter shifted for it.
+        let a = key(&mut us, KEY_A, true);
+        assert_eq!(a.last(), Some(&sym(0x61, true)));
+        assert!(!a.contains(&sym(0xff09, true)));
+    }
+
+    #[test]
+    fn a_held_dead_key_is_let_go_before_the_next_character() {
+        // US International: Shift+apostrophe is dead_diaeresis; on a French
+        // server it sits on the shifted level, so Mutter's Shift for it must
+        // not reach the next letter.
+        const KEY_APOSTROPHE: u32 = 40;
+        let mut t = with_server("us(intl)", "fr");
+        key(&mut t, KEY_LEFTSHIFT, true);
+        let dead = key(&mut t, KEY_APOSTROPHE, true);
+        assert_eq!(dead, [sym(0xfe57, true)], "dead_diaeresis");
+        key(&mut t, KEY_LEFTSHIFT, false);
+        assert_eq!(
+            key(&mut t, KEY_A, true),
+            [sym(0xfe57, false), sym(0x61, true)]
+        );
+        assert!(key(&mut t, KEY_APOSTROPHE, false).is_empty());
+    }
+
+    #[test]
     fn a_server_with_several_layouts_keeps_key_codes() {
         // Which layout is active there is not known, so no comparison.
         let mut t = t();

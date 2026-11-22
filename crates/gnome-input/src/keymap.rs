@@ -44,6 +44,11 @@ const MODIFIERS: [u32; 10] = [
 ];
 /// The keypad's keysyms, KP_Space to KP_9.
 const KEYPAD: std::ops::RangeInclusive<u32> = 0xff80..=0xffbf;
+/// The dead keysyms, dead_grave to dead_longsolidusoverlay. They type no
+/// character of their own but make one with the next key, and Mutter treats
+/// them like any key that needs its Shift pressed, so they are character keys
+/// here (let go before the next one).
+const DEAD: std::ops::RangeInclusive<u32> = 0xfe50..=0xfe93;
 /// What KP_Home to KP_Delete (0xff95 to 0xff9f) are without the keypad: Home,
 /// Left, Up, Right, Down, Prior, Next, End, Begin, Insert, Delete.
 const KEYPAD_NAV: [u32; 11] = [
@@ -110,6 +115,7 @@ fn plain(sym: u32) -> u32 {
         0xff80 => 0x20,                           // KP_Space
         0xff89 => 0xff09,                         // KP_Tab
         0xff8d => 0xff0d,                         // KP_Enter
+        0xfe20 => 0xff09, // ISO_Left_Tab: Mutter adds a Shift of its own for it
         0xff91..=0xff94 => sym - 0xff91 + 0xffbe, // KP_F1..F4
         0xff95..=0xff9f => KEYPAD_NAV[(sym - 0xff95) as usize],
         s if KEYPAD.contains(&s) => match xkb::keysym_to_utf32(xkb::Keysym::new(s)) {
@@ -309,7 +315,7 @@ impl ViewerKeys {
         match plain(sym) {
             SHIFT_L | SHIFT_R => Sent::Shift,
             s if LOCKS.contains(&s) || LEVEL_SHIFTS.contains(&s) => Sent::Local,
-            s if types_a_character(s) => Sent::Text(s),
+            s if types_a_character(s) || DEAD.contains(&s) => Sent::Text(s),
             s => Sent::Keysym(s),
         }
     }
