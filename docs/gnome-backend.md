@@ -185,6 +185,14 @@ applications (it replaces the desktop's clipboard while it runs):
 serve_probe target/debug/gliff-server --headless --rich-clipboard
 ```
 
+`--headless --soak SECS` keeps the session up for SECS seconds, resizing it
+every few seconds (sizes and scales up to 4K at scale 2), and prints the
+server's memory, open files and threads after every full cycle of sizes; it
+fails on a resize without the stream asked for and a frame, or on growth beyond a margin after the first
+cycle, which is a tolerance and not a leak detector (a first 8-minute run on
+the NVIDIA desktop showed no growth, and a 5-minute one with per-cycle
+samples held flat to 4 kB; hours would be needed to say more).
+
 ## The viewer on GNOME
 
 The `gliff` viewer needs no GNOME-specific code: it reads the local keymap and
@@ -201,7 +209,9 @@ show up when you use it:
   under 800x480 logical pixels). Tested on a real NVIDIA GPU; on the
   software-rendered test VM a scale of 1.75 crashed GNOME Shell once, so a
   host without a GPU may do the same. A new scale at the same pixel size is
-  ignored by Mutter until the size changes. See "Scale (HiDPI) on GNOME" in
+  ignored by Mutter until the size changes, and in our runs a size the screen
+  already had at another scale came back with that earlier scale (the stream
+  and the pointer mapping follow the scale Mutter applied). See "Scale (HiDPI) on GNOME" in
   `docs/PLAN.md`.
 
 ## Keeping up with upstream

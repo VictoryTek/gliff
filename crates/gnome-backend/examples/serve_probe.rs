@@ -14,6 +14,11 @@
 //! the server's clipboard both ways, with a plain Mutter client playing the desktop's applications. It
 //! replaces the desktop's clipboard: run it where that is fine.
 //!
+//! With `--headless --soak SECS` the session then stays up for SECS seconds,
+//! resizing (and changing the scale) every few seconds, and samples the
+//! server's memory, open files and threads, to catch a leak or a stall that a
+//! short run cannot.
+//!
 //! One line per check, `[ OK ]` or `[FAIL]`. It does not decode video: it
 //! checks that frames of the announced size arrive and are acknowledged.
 
@@ -251,7 +256,19 @@ async fn main() {
         }
         None => false,
     };
-    let healthy = run(&server, &extra, headless, clipboard, rich).await;
+    let mut soak = None;
+    if let Some(i) = extra.iter().position(|a| a == "--soak") {
+        soak = extra
+            .get(i + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&secs| secs > 0 && secs <= 7 * 24 * 3600);
+        if soak.is_none() || !headless {
+            eprintln!("--soak SECS needs a duration of 1 s to a week, and --headless");
+            std::process::exit(2);
+        }
+        extra.drain(i..(i + 2).min(extra.len()));
+    }
+    let healthy = run(&server, &extra, headless, clipboard, rich, soak).await;
     std::process::exit(if healthy { 0 } else { 1 });
 }
 
@@ -261,6 +278,7 @@ async fn run(
     headless: bool,
     clipboard: Option<u64>,
     rich: bool,
+    soak_secs: Option<u64>,
 ) -> bool {
     let before = match monitor_names() {
         Ok(n) => n,
@@ -498,6 +516,10 @@ async fn run(
         }
     }
 
+    if let (Some(secs), true, Some(pid)) = (soak_secs, headless, child.id()) {
+        healthy &= soak(&mut c, pid, secs).await;
+    }
+
     // After a failed rich check the stream may be in the middle of a message:
     // the text offer below is skipped, and the serial the rich check made the
     // server's requests name no longer applies.
@@ -536,7 +558,8 @@ async fn run(
     drop(c.wr);
     let status = timeout(Duration::from_secs(10), child.wait()).await;
     match status {
-        Ok(Ok(s)) => ok("exit", format!("{s}")),
+        Ok(Ok(s)) if s.success() => ok("exit", format!("{s}")),
+        Ok(Ok(s)) => healthy &= fail("exit", format!("the server ended with {s}")),
         Ok(Err(e)) => healthy &= fail("exit", e),
         Err(_) => {
             healthy &= fail("exit", "the server did not end within 10 s");
@@ -1156,4 +1179,228 @@ async fn rich_clipboard(c: &mut Client) -> bool {
         );
     }
     healthy
+}
+
+// ---- the soak -----------------------------------------------------------
+
+/// What `/proc` says about the server process.
+#[derive(Clone, Copy, Debug)]
+struct Usage {
+    rss_kb: u64,
+    fds: usize,
+    threads: u64,
+}
+
+fn usage(pid: u32) -> Option<Usage> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let field = |name: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+    };
+    Some(Usage {
+        rss_kb: field("VmRSS:")?,
+        threads: field("Threads:")?,
+        fds: std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count(),
+    })
+}
+
+/// Keep the session up for `secs`, resizing every few seconds through sizes
+/// and scales, and watch that every resize gets the stream it asked for and a
+/// frame after it, and that the server's resources do not grow. The server is
+/// sampled after every full cycle of sizes, so the samples are at the same
+/// point of the same sawtooth (a 4K step costs memory that the next smaller
+/// one gives back).
+async fn soak(c: &mut Client, pid: u32, secs: u64) -> bool {
+    const STEPS: [(u32, u32, f32); 6] = [
+        (1280, 720, 1.0),
+        (1920, 1080, 1.0),
+        (2560, 1440, 2.0),
+        (1600, 900, 1.0),
+        (3840, 2160, 2.0),
+        (1728, 972, 1.5),
+    ];
+    // Each size always comes with the same scale: Mutter keeps the scale a
+    // virtual monitor first had at a size and gives it back when the size
+    // returns, whatever scale is asked for then (see docs/PLAN.md).
+    let mut healthy = true;
+    let Some(first) = usage(pid) else {
+        return fail("soak", "cannot read the server's /proc entry");
+    };
+    println!("soak: {secs} s, server pid {pid}, at start {first:?}");
+    let start = Instant::now();
+    let Some(end) = start.checked_add(Duration::from_secs(secs)) else {
+        return fail("soak", "the duration is too long");
+    };
+    // The reference for growth: the sample after the first full cycle
+    // (one-off allocations and caches are in by then). Every later sample is
+    // held against it, all three counters.
+    let mut baseline: Option<Usage> = None;
+    let mut later = 0u32;
+    let mut worst: Option<(Usage, String)> = None;
+    let mut last = first;
+    let (mut resizes, mut slowest, mut total_wait) = (0u32, Duration::ZERO, Duration::ZERO);
+    let mut n = 0usize;
+    'run: while Instant::now() < end {
+        let (w, h, scale) = STEPS[n % STEPS.len()];
+        n += 1;
+        let configs = c.seen.configs;
+        let sent = Instant::now();
+        let msg = ClientMsg::Resize {
+            width: w,
+            height: h,
+            scale,
+        };
+        let step = async {
+            c.wr.write_msg(&msg).await.map_err(|e| e.to_string())?;
+            c.until(Duration::from_secs(10), |s| {
+                s.configs > configs && s.frames > s.frames_at_config
+            })
+            .await
+        };
+        match timeout(Duration::from_secs(20), step).await {
+            Ok(Ok(true)) => {
+                let took = sent.elapsed();
+                resizes += 1;
+                total_wait += took;
+                slowest = slowest.max(took);
+            }
+            Ok(Ok(false)) => {
+                healthy &= fail(
+                    "soak",
+                    format!("resize {n} to {w}x{h} at {scale}: no new stream and frame in 10 s"),
+                );
+                break;
+            }
+            Ok(Err(e)) => {
+                healthy &= fail("soak", format!("resize {n}: {e}"));
+                break;
+            }
+            Err(_) => {
+                healthy &= fail("soak", format!("resize {n}: stuck for 20 s"));
+                break;
+            }
+        }
+        // The stream must be what was asked for: the size as asked, and the
+        // scale as asked (a fractional one may be rounded by Mutter, to a
+        // scale between 1 and 2 here).
+        let got = (c.seen.stream, c.seen.scale_milli);
+        let scale_ok = if scale.fract() == 0.0 {
+            got.1 == (scale * 1000.0) as u32
+        } else {
+            (1000..=2000).contains(&got.1)
+        };
+        if got.0 != Some((w, h)) || !scale_ok {
+            healthy &= fail(
+                "soak",
+                format!(
+                    "resize {n}: asked {w}x{h} at {scale}, the stream is {:?} at scale {}",
+                    got.0, got.1
+                ),
+            );
+            break;
+        }
+        // Idle for a few seconds, still reading (and acknowledging) whatever
+        // the server sends; a read that fails (the server went away) ends the
+        // soak.
+        match timeout(
+            Duration::from_secs(5),
+            c.until(Duration::from_secs(3), |_| false),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                healthy &= fail("soak", format!("the connection ended: {e}"));
+                break;
+            }
+            Err(_) => {
+                healthy &= fail("soak", "a message never finished");
+                break;
+            }
+        }
+        // After every full cycle.
+        if n.is_multiple_of(STEPS.len()) {
+            let Some(u) = usage(pid) else {
+                healthy &= fail("soak", "the server process is gone");
+                break 'run;
+            };
+            println!(
+                "soak: t={:>4}s  rss {:>7} kB  fds {:>3}  threads {:>3}  resizes {:>3}  frames {}",
+                start.elapsed().as_secs(),
+                u.rss_kb,
+                u.fds,
+                u.threads,
+                resizes,
+                c.seen.frames
+            );
+            last = u;
+            match baseline {
+                None => baseline = Some(u),
+                Some(b) => {
+                    later += 1;
+                    let breach = growth_breach(&b, &u);
+                    if let Some(what) = breach {
+                        if worst.is_none() {
+                            worst = Some((u, what));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // One last look, so a server that went away during the last idle is seen.
+    // Growth is judged only on the samples at the end of a full cycle: after
+    // a 4K step, for one, the memory is not comparable with the baseline.
+    if usage(pid).is_none() {
+        healthy &= fail("soak", "the server process is gone at the end");
+    }
+    if resizes > 0 {
+        ok(
+            "soak resizes",
+            format!(
+                "{resizes} in {} s, each with the stream asked for and a frame; slowest {} ms, mean {} ms",
+                start.elapsed().as_secs(),
+                slowest.as_millis(),
+                (total_wait / resizes).as_millis()
+            ),
+        );
+    }
+    match (baseline, later) {
+        (Some(b), 1..) => {
+            let line = format!(
+                "after the first cycle {b:?}, at the end {last:?}, {later} later sample(s), one per cycle"
+            );
+            match worst {
+                None => ok("soak resources", line),
+                Some((u, what)) => {
+                    healthy &= fail("soak resources", format!("{what} at {u:?}; {line}"))
+                }
+            }
+        }
+        _ => {
+            healthy &= fail(
+                "soak resources",
+                "no verdict: the run was too short for the first cycle and at least one later one (about a minute)",
+            )
+        }
+    }
+    healthy
+}
+
+/// What, if anything, a sample has grown past the margins from the baseline:
+/// memory by more than a quarter and 50 MB, open files by more than 8,
+/// threads by more than 4. A tolerance, not a leak detector: a slow leak
+/// under the margins needs a run of hours to show.
+fn growth_breach(b: &Usage, u: &Usage) -> Option<String> {
+    if u.rss_kb > b.rss_kb + b.rss_kb / 4 + 50_000 {
+        Some(format!("memory {} -> {} kB", b.rss_kb, u.rss_kb))
+    } else if u.fds > b.fds + 8 {
+        Some(format!("open files {} -> {}", b.fds, u.fds))
+    } else if u.threads > b.threads + 4 {
+        Some(format!("threads {} -> {}", b.threads, u.threads))
+    } else {
+        None
+    }
 }

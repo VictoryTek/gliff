@@ -305,6 +305,49 @@ fn scales(desktop: &GraphicalSession) -> bool {
     healthy
 }
 
+/// Go back to a size the monitor had at another scale, and say what Mutter
+/// reports at once and two seconds later (the server's soak found it giving
+/// the old scale back).
+fn revisit(desktop: &GraphicalSession) -> bool {
+    let (out, rx) = match create(desktop, (1280, 720)) {
+        Ok(v) => v,
+        Err(e) => return fail("create", format!("{e:#}")),
+    };
+    let mut healthy = true;
+    // Every step changes the size, so the scale asked for is applied.
+    let steps = [
+        ((1920, 1080), 1.5),
+        ((1280, 720), 1.0),
+        ((1920, 1080), 1.0),
+        ((1280, 720), 1.0),
+        ((1920, 1080), 2.0),
+        ((1280, 720), 1.0),
+        ((1920, 1080), 1.0),
+        ((2560, 1440), 2.0),
+        ((1920, 1080), 1.0),
+    ];
+    for (size, scale) in steps {
+        if let Err(e) = out.resize(size.0, size.1, scale) {
+            healthy &= fail("revisit", format!("asked {size:?} at {scale}: {e:#}"));
+            continue;
+        }
+        let at = |out: &VirtualOutput| out.monitor().map(|m| m.scale).unwrap_or(f64::NAN);
+        let now = at(&out);
+        std::thread::sleep(Duration::from_secs(2));
+        let later = at(&out);
+        let line = format!("asked {size:?} at {scale}: reports {now} at once, {later} 2 s later");
+        if (now - scale).abs() < 0.01 && (later - scale).abs() < 0.01 {
+            ok("revisit", line);
+        } else {
+            healthy &= fail("revisit", line);
+        }
+        if let Err(e) = frame_size(&out, &rx, size) {
+            healthy &= fail("revisit frame", e);
+        }
+    }
+    healthy
+}
+
 /// Report the screen state every 10 s for `secs`, with or without an output.
 fn watch(desktop: &GraphicalSession, secs: u64, hold: bool) -> bool {
     let conn = match mutter::connect(&desktop.bus_address) {
@@ -366,6 +409,7 @@ fn main() {
         None => run(&desktop),
         Some("scales") => scales(&desktop),
         Some("fresh") => fresh(&desktop),
+        Some("revisit") => revisit(&desktop),
         Some(mode @ ("hold" | "idle")) => {
             let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
             watch(&desktop, secs, mode == "hold")
