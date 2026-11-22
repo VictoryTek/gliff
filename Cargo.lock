@@ -1156,7 +1156,10 @@ dependencies = [
  "anyhow",
  "gnome-capture",
  "gnome-ipc",
+ "gtk4",
  "hypr-input",
+ "tracing",
+ "xkbcommon",
 ]
 
 [[package]]

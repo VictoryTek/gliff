@@ -13,6 +13,9 @@ workspace = true
 anyhow.workspace = true
 gnome-ipc = { path = "../gnome-ipc" }
 hypr-input.workspace = true
+tracing.workspace = true
+xkbcommon.workspace = true
+gtk4.workspace = true
 # Only the probe uses this: it watches the cursor come back through the
 # capture stream to prove injected motion landed.
 gnome-capture = { path = "../gnome-capture" }

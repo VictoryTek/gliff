@@ -69,6 +69,9 @@ pub struct GnomeBackend {
     default_node: PathBuf,
     /// What Vulkan said for each render node asked about.
     offers: Mutex<HashMap<PathBuf, Offer>>,
+    /// The desktop's own keyboard layout, for the input to compare the
+    /// viewer's with.
+    server_keymap: gnome_input::ServerKeymap,
 }
 
 enum Slot {
@@ -148,12 +151,14 @@ impl GnomeBackend {
         let default_node = std::env::var_os("GLIFF_RENDER_NODE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(hypr_capture::DEFAULT_RENDER_NODE));
+        let server_keymap = gnome_input::ServerKeymap::follow(&desktop);
         Ok(Self {
             desktop,
             conn,
             outputs: Mutex::new(HashMap::new()),
             default_node,
             offers: Mutex::new(HashMap::new()),
+            server_keymap,
         })
     }
 
@@ -409,7 +414,8 @@ impl Backend for GnomeBackend {
             (f64::from(m.width) / scale).round().max(1.0) as u32,
             (f64::from(m.height) / scale).round().max(1.0) as u32,
         );
-        let input = gnome_input::Input::new(held.session().input(), held.stream_path(), extent);
+        let input = gnome_input::Input::new(held.session().input(), held.stream_path(), extent)
+            .with_server_keymap(self.server_keymap.clone());
         Ok(Box::new(GnomeInput { input, _held: held }))
     }
 

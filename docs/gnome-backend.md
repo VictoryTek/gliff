@@ -78,9 +78,35 @@ gliff-gnome-input-probe caps    # taps Caps Lock twice and checks it toggled and
 ```
 
 `move` is checked by reading the pointer back through the capture stream.
-Keys are sent as keycodes read with the server's keyboard layout, so a viewer
-with a different layout types the wrong characters until keymap forwarding
-exists; a keymap sent by the viewer is refused with an error.
+
+Keys go as keycodes, which Mutter reads with the server's layout, as long as
+the viewer's layout is the server's (or the viewer has sent none, or the server
+has several layouts, since the active one is not known here), so nothing
+changes for the common case. The server's layout is read from the compositor
+(a Wayland keyboard receives the seat's keymap, like the viewer reads its own).
+When the viewer's layout differs, every key goes through the viewer's layout on
+the server and is sent as the keysym it makes there (a German viewer's Y key is
+`z` on a US desktop); Mutter finds the key for the keysym and presses the Shift
+it needs. In that mode Shift, AltGr and the lock keys stay on the server side
+of the translation (a Shift that reached Mutter as well would apply twice, and
+a French Shift+1 is `1`); Shift reaches Mutter for keys that are not characters
+(Shift+Left), for clicks and for the wheel, and is let go before the next
+character; Control, Alt and Super go as themselves; the keypad's keys go as the
+plain characters and navigation keys (so the server's Num Lock does not matter)
+and the keypad starts as the server's Num Lock is; only one character key is
+held on the server at a time, and it is let go before a key that is not a
+character and before a click or scroll. Limits: a character that has no
+key at level 1 or 2 of the server's layout (`ö` on a US desktop, anything that
+needs AltGr there) is not typed, because Mutter's keysym call neither makes a
+key for it nor presses AltGr; give the server the layouts its users need. A Caps
+Lock that is on at the server inverts letters, as it would at the keyboard.
+Check it with the layout probe, which opens a fullscreen window on the primary
+monitor, clicks into its text field and types with several layouts, comparing
+what the field received:
+
+```
+gliff-gnome-layout-probe      # run on a machine nobody is using
+```
 
 ## `gnome-clipboard`
 

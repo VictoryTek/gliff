@@ -25,6 +25,14 @@ impl InputPort {
             .context("NotifyKeyboardKeycode")
     }
 
+    /// A key by keysym: Mutter finds the key for it in the session's keymap,
+    /// or makes one, whatever the layout is.
+    pub fn keysym(&self, sym: u32, pressed: bool) -> Result<()> {
+        self.rd
+            .call::<_, _, ()>("NotifyKeyboardKeysym", &(sym, pressed))
+            .context("NotifyKeyboardKeysym")
+    }
+
     /// A pointer button by evdev `BTN_*` code.
     pub fn button(&self, button: u32, pressed: bool) -> Result<()> {
         self.rd
