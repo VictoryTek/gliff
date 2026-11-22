@@ -19,6 +19,13 @@
 //! server's memory, open files and threads, to catch a leak or a stall that a
 //! short run cannot.
 //!
+//! With `--load SECS` (a mirrored screen, with `gliff-gnome-animate` running
+//! on it) the client then judges the stream while the picture changes all the
+//! time: frames per second, the longest gap, bytes per frame, the server's CPU
+//! and memory. `--stall SECS` adds a stretch where the client stops reading, as
+//! a slow link would, and checks that the server's memory stays bounded and
+//! that the stream resumes without replaying the backlog.
+//!
 //! One line per check, `[ OK ]` or `[FAIL]`. It does not decode video: it
 //! checks that frames of the announced size arrive and are acknowledged.
 
@@ -56,6 +63,8 @@ struct Seen {
     configs: u32,
     frames_at_config: u64,
     pipeline: Option<gliff_proto::VideoPipeline>,
+    /// When set, every video frame is logged: arrival time, id, bytes, key.
+    frame_log: Option<Vec<(Instant, u64, usize, bool)>>,
     cursor_shapes: u32,
     cursor: Option<(f64, f64, bool)>,
     /// Selections the server reported, by mime types.
@@ -99,6 +108,7 @@ impl Client {
                 frame_id,
                 data_len,
                 aux_len,
+                keyframe,
                 ..
             } => {
                 self.rd
@@ -107,6 +117,14 @@ impl Client {
                     .map_err(|e| e.to_string())?;
                 self.seen.frames += 1;
                 self.seen.last_frame_id = *frame_id;
+                if let Some(log) = self.seen.frame_log.as_mut() {
+                    log.push((
+                        Instant::now(),
+                        *frame_id,
+                        (*data_len + *aux_len) as usize,
+                        *keyframe,
+                    ));
+                }
                 let ack = ClientMsg::FrameAck {
                     frame_id: *frame_id,
                     decoded_at_ms: 0,
@@ -268,7 +286,38 @@ async fn main() {
         }
         extra.drain(i..(i + 2).min(extra.len()));
     }
-    let healthy = run(&server, &extra, headless, clipboard, rich, soak).await;
+    // --load SECS [--stall SECS]: judge the stream while the screen changes
+    // all the time (run gliff-gnome-animate beside it), and then while the
+    // client stops reading.
+    let mut load = None;
+    let mut stall = None;
+    for (flag, slot) in [("--load", &mut load), ("--stall", &mut stall)] {
+        if let Some(i) = extra.iter().position(|a| a == flag) {
+            *slot = extra
+                .get(i + 1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&secs| secs > 0 && secs <= 3600);
+            if slot.is_none() {
+                eprintln!("{flag} needs a duration of 1 s to an hour");
+                std::process::exit(2);
+            }
+            extra.drain(i..(i + 2).min(extra.len()));
+        }
+    }
+    if (load.is_some() && headless) || (stall.is_some() && load.is_none()) {
+        eprintln!("--load works on a mirrored screen (no --headless); --stall needs --load");
+        std::process::exit(2);
+    }
+    let healthy = run(
+        &server,
+        &extra,
+        headless,
+        clipboard,
+        rich,
+        soak,
+        load.map(|l| (l, stall)),
+    )
+    .await;
     std::process::exit(if healthy { 0 } else { 1 });
 }
 
@@ -279,6 +328,7 @@ async fn run(
     clipboard: Option<u64>,
     rich: bool,
     soak_secs: Option<u64>,
+    load: Option<(u64, Option<u64>)>,
 ) -> bool {
     let before = match monitor_names() {
         Ok(n) => n,
@@ -520,6 +570,10 @@ async fn run(
         healthy &= soak(&mut c, pid, secs).await;
     }
 
+    if let (Some((secs, stall)), Some(pid)) = (load, child.id()) {
+        healthy &= load_test(&mut c, pid, secs, stall).await;
+    }
+
     // After a failed rich check the stream may be in the middle of a message:
     // the text offer below is skipped, and the serial the rich check made the
     // server's requests name no longer applies.
@@ -580,6 +634,7 @@ async fn run(
                     || l.contains("clipboard")
                     || l.contains("ERROR")
                     || l.contains("session output ready")
+                    || l.contains("ladder step")
             })
             .collect::<Vec<_>>();
         println!("server log ({} lines), notable:", lines.len());
@@ -1403,4 +1458,211 @@ fn growth_breach(b: &Usage, u: &Usage) -> Option<String> {
     } else {
         None
     }
+}
+
+// ---- the load test ------------------------------------------------------
+
+/// Clock ticks a second, as `/proc/PID/stat` counts CPU time (usually 100).
+fn clock_ticks() -> f64 {
+    std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(100.0)
+}
+
+/// CPU time the process has used, in seconds (user plus system).
+fn cpu_secs(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and may hold spaces: count from the
+    // closing one. Fields 14 and 15 are the user and system ticks.
+    let after = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let ticks: u64 = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+    Some(ticks as f64 / clock_ticks())
+}
+
+/// What the frames logged since `from` add up to.
+struct Rate {
+    frames: usize,
+    per_second: f64,
+    mean_bytes: usize,
+    max_gap_ms: u128,
+    keyframes: usize,
+}
+
+/// `begin` and `end` bound the window: the wait for the first frame and the
+/// silence after the last one count as gaps too.
+fn rate(
+    log: &[(Instant, u64, usize, bool)],
+    from: usize,
+    window: Duration,
+    begin: Instant,
+    end: Instant,
+) -> Rate {
+    let part = &log[from.min(log.len())..];
+    let inner = part
+        .windows(2)
+        .map(|w| w[1].0.duration_since(w[0].0))
+        .max()
+        .unwrap_or(Duration::ZERO);
+    let edges = match (part.first(), part.last()) {
+        (Some(first), Some(last)) => first
+            .0
+            .duration_since(begin)
+            .max(end.saturating_duration_since(last.0)),
+        _ => window,
+    };
+    let max_gap = inner.max(edges);
+    Rate {
+        frames: part.len(),
+        per_second: part.len() as f64 / window.as_secs_f64(),
+        mean_bytes: part.iter().map(|f| f.2).sum::<usize>() / part.len().max(1),
+        max_gap_ms: max_gap.as_millis(),
+        keyframes: part.iter().filter(|f| f.3).count(),
+    }
+}
+
+/// Read for `dur`, each read bounded as a whole (a half-sent payload or a
+/// blocked acknowledgement ends it with an error).
+async fn read_for(c: &mut Client, dur: Duration) -> Result<(), String> {
+    let end = Instant::now() + dur;
+    while Instant::now() < end {
+        match timeout(Duration::from_secs(5), c.step(Duration::from_millis(100))).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err("a message never finished (5 s)".into()),
+        }
+    }
+    Ok(())
+}
+
+async fn load_test(c: &mut Client, pid: u32, secs: u64, stall: Option<u64>) -> bool {
+    let healthy = load_test_inner(c, pid, secs, stall).await;
+    c.seen.frame_log = None;
+    healthy
+}
+
+async fn load_test_inner(c: &mut Client, pid: u32, secs: u64, stall: Option<u64>) -> bool {
+    let mut healthy = true;
+    let (Some(rss0), Some(cpu0)) = (usage(pid), cpu_secs(pid)) else {
+        return fail("load", "cannot read the server's /proc entry");
+    };
+    c.seen.frame_log = Some(Vec::new());
+    let started = Instant::now();
+    if let Err(e) = read_for(c, Duration::from_secs(secs)).await {
+        return fail("load", format!("read failed: {e}"));
+    }
+    let ended = Instant::now();
+    let window = ended.duration_since(started);
+    let log = c.seen.frame_log.take().unwrap_or_default();
+    // Frames per second in slices of ten seconds: the server starts at a low
+    // frame rate and raises it as the link proves itself.
+    let slices: Vec<String> = (0..window.as_secs() / 10)
+        .map(|i| {
+            let (lo, hi) = (
+                Duration::from_secs(i * 10),
+                Duration::from_secs(i * 10 + 10),
+            );
+            let n = log
+                .iter()
+                .filter(|f| {
+                    let t = f.0.duration_since(started);
+                    t >= lo && t < hi
+                })
+                .count();
+            format!("{:.0}", n as f64 / 10.0)
+        })
+        .collect();
+    println!(
+        "load: frames per second by ten seconds: {}",
+        slices.join(", ")
+    );
+    let r = rate(&log, 0, window, started, ended);
+    let cpu = cpu_secs(pid).unwrap_or(cpu0) - cpu0;
+    let rss1 = usage(pid).unwrap_or(rss0);
+    let line = format!(
+        "{} frames in {:.0} s = {:.1} per second, {} bytes a frame ({:.1} Mbit/s), longest gap {} ms, {} key frame(s); server CPU {:.0}% of one core, memory {} -> {} kB",
+        r.frames,
+        window.as_secs_f64(),
+        r.per_second,
+        r.mean_bytes,
+        r.per_second * r.mean_bytes as f64 * 8.0 / 1e6,
+        r.max_gap_ms,
+        r.keyframes,
+        cpu / window.as_secs_f64() * 100.0,
+        rss0.rss_kb,
+        rss1.rss_kb
+    );
+    // A changing picture must give a steady stream: not a few frames a second
+    // (the animation is not running, or the server cannot keep up), and no
+    // pause of a second.
+    if r.per_second >= 20.0 && r.max_gap_ms < 1000 {
+        ok("load", line);
+    } else {
+        healthy &= fail(
+            "load",
+            format!("{line} (wanted at least 20 per second and no gap of a second)"),
+        );
+    }
+
+    let Some(stall) = stall else {
+        return healthy;
+    };
+    // The client stops reading and acknowledging, as a slow link would. What
+    // is measured is the server's memory at samples during the stall (bounded
+    // by whatever combination of unacknowledged-byte limit, blocked writer and
+    // replaced capture it uses; this does not say which) and that frames come
+    // promptly when the client reads again. It cannot say whether the first
+    // frames are fresh: some come from the pipe's buffer.
+    let before = usage(pid).unwrap_or(rss1);
+    let last_id = c.seen.last_frame_id;
+    println!("load: not reading for {stall} s");
+    let stalled = Instant::now();
+    let mut peak = before.rss_kb;
+    while stalled.elapsed() < Duration::from_secs(stall) {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(u) = usage(pid) {
+            peak = peak.max(u.rss_kb);
+        } else {
+            return fail("stall", "the server process is gone");
+        }
+    }
+    c.seen.frame_log = Some(Vec::new());
+    let resumed = Instant::now();
+    let resume_window = Duration::from_secs(10);
+    if let Err(e) = read_for(c, resume_window).await {
+        return fail("stall", format!("read failed after the stall: {e}"));
+    }
+    let resumed_end = Instant::now();
+    let log = c.seen.frame_log.take().unwrap_or_default();
+    let first_after = log.first().map(|f| f.0.duration_since(resumed));
+    let first_two: Vec<_> = log
+        .iter()
+        .take_while(|f| f.0.duration_since(resumed) < Duration::from_secs(2))
+        .collect();
+    let all = rate(&log, 0, resume_window, resumed, resumed_end);
+    let jump = log.first().map(|f| f.1.saturating_sub(last_id));
+    let line = format!(
+        "after {stall} s: memory peaked at {peak} kB (was {} kB); first frame {:?} after reading again, frame id jumped by {:?}; {} frames in the first 2 s, {:.1} per second over 10 s",
+        before.rss_kb,
+        first_after.map(|d| d.as_millis()),
+        jump,
+        first_two.len(),
+        all.per_second
+    );
+    // Memory: no more than 100 MB over where it was at the samples. Resume: a
+    // frame within 3 s, and the first two seconds not a replay of a long
+    // stall's frames (a backlog would be hundreds).
+    let mem_ok = peak <= before.rss_kb + 100_000;
+    let resumed_ok = first_after.is_some_and(|d| d < Duration::from_secs(3));
+    let backlog_ok = first_two.len() <= 240;
+    if mem_ok && resumed_ok && backlog_ok && all.per_second >= 20.0 {
+        ok("stall", line);
+    } else {
+        healthy &= fail("stall", line);
+    }
+    healthy
 }

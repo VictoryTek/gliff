@@ -185,6 +185,18 @@ applications (it replaces the desktop's clipboard while it runs):
 serve_probe target/debug/gliff-server --headless --rich-clipboard
 ```
 
+`--load SECS` (on a mirrored screen, with `gliff-gnome-animate` running on it)
+reads the stream while the picture changes all the time and reports frames per
+second, bytes a frame, the longest gap and the server's CPU and memory;
+`--stall SECS` adds a stretch where the client stops reading, and checks that
+the server's memory stays bounded and that frames come promptly when it reads
+again (it does not check that the first ones are fresh):
+
+```
+gliff-gnome-animate 90 &                  # a fullscreen window that changes every frame
+serve_probe target/debug/gliff-server --load 30 --stall 20
+```
+
 `--headless --soak SECS` keeps the session up for SECS seconds, resizing it
 every few seconds (sizes and scales up to 4K at scale 2), and prints the
 server's memory, open files and threads after every full cycle of sizes; it
