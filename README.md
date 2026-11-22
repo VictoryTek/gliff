@@ -6,6 +6,10 @@ gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
 ssh: no open ports, no accounts, no relay.
 
+> **This fork is adding GNOME support.** The remote machine can also run a
+> GNOME (Mutter) session, not only Hyprland. It is work in progress; see
+> [docs/gnome-backend.md](docs/gnome-backend.md) for what works so far.
+
 Text stays sharp. Most remote desktops send video with halved colour
 resolution, which blurs coloured text; gliff sends full-resolution colour
 (4:4:4) through the H.264 hardware every GPU has. Video runs on the GPU at
@@ -26,6 +30,7 @@ both ends, and falls back to the CPU on machines where it cannot.
 ## Requirements
 
 - Hyprland on both machines, with a session running on the remote one.
+  (In this fork the remote one may also be a GNOME session, in progress.)
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
   (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and

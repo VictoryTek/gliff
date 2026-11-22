@@ -69,9 +69,9 @@ You asked for a separate "GNOME branch". I recommend a small change to that idea
 
 - `upstream` branch: an exact copy of omacom/gliff, fast-forward only. A weekly job updates it.
 - `main`: upstream plus **our additions**. The additions are new crates plus one small "seam" change.
-- The **seam**: Gliff's server calls Hyprland directly in about 8 places in `crates/gliff-server/src/session.rs` (77 KB) and `main.rs`. We replace those calls with a small `Backend` interface. This is the only edit to upstream files that matters. It's the only place merge conflicts will happen, so we keep it as small as possible.
+- The **seam**: Gliff's server calls Hyprland directly in about 8 places in `crates/gliff-server/src/session.rs` (77 KB) and `main.rs`. We replace those calls with a small `Backend` interface. This is the only edit to upstream files that matters. It is where nearly all merge conflicts will happen, so we keep it as small as possible (see "Upstream sync" in the log below for what it came to).
 - The GNOME code lives in **new crates** (`gnome-ipc`, `gnome-capture`, `gnome-input`, `gnome-clipboard`) that upstream never touches, so those never conflict.
-- Every week a CI job merges `upstream` into `main`, builds, runs the tests, and opens a pull request for you to approve. It labels the PR **"needs GNOME mirror"** if upstream changed the Hyprland-only crates (`hypr-*`) or the session code. Those are the changes that need a matching change in the GNOME crates. Changes to video, protocol, viewer or clipboard flow automatically.
+- Every week a CI job merges `upstream` into `main`, builds, runs the tests, and opens a pull request for you to approve. It labels the PR **"needs GNOME mirror"** if upstream changed the Hyprland-only crates (`hypr-*`) or the session code. Those are the changes that need a matching change in the GNOME crates. Changes to video, viewer or clipboard flow mostly flow automatically, but a protocol or server change can still need GNOME work, which is why the label goes on any change to those crates too.
 - **First step upstream:** before writing any code, open an issue upstream saying "we'd like to add a compositor backend interface and a GNOME backend". If they accept the seam, our fork shrinks to just the GNOME crates and the sync problem mostly disappears. If not, we carry the small seam patch ourselves.
 
 ## Verified facts vs unverified
@@ -404,6 +404,17 @@ A private (`--headless`) screen now follows the viewer's scale: `GnomeBackend::s
 - `serve_probe` now declares 3840x2160 as its maximum (it declared 1920x1080, which capped every larger resize) and has the scale steps above.
 - **Not covered:** the software-rendered VM (where it crashed; a GNOME host without a render node may still crash on scale above 1, untested), AMD and Intel hosts, the real viewer on a HiDPI display (by eye), the monitor Mutter picks for a scale it does not support (the session follows what it reads back).
 
+### Upstream sync: how much the fork costs to keep (2026-11-21)
+
+Asked: do the changes so far still let us merge upstream as it changes? Answer: yes, but not for free. Everything GNOME is in new crates and files that upstream cannot conflict with; the cost is the seam in `crates/gliff-server/src/session.rs`.
+
+- **Footprint** (`git diff` from the merge base `9d93732`, which is also upstream's tip, so no real merge has been tried yet): `session.rs` 46 hunks (+75, -103), `clipboard.rs` 4, `hypr-capture/src/lib.rs` 6, `main.rs` 2, `gliff-vk/src/device.rs` 1 (one new function), the workspace and server manifests, `action.yml` one line, `README.md` a short note, and the generated `Cargo.lock` (regenerate it after a merge, do not hand-merge it).
+- **Upstream churn before the base** (the project is two months old, 325 commits): `session.rs` was touched by 24 commits in the last 30 days (53 in all), `main.rs` 11, `hypr-capture/src/lib.rs` 21, `gliff-vk/src/device.rs` 11, `clipboard.rs` 6.
+- **Proxy test** (throwaway clone, deleted): our diff applied with a three-way merge onto upstream 10, 20, 40 and 60 commits before its tip conflicts in `session.rs` in 7, 9, 16 and 21 regions, and from 40 commits back also in `hypr-capture/src/lib.rs` (4); at 60 one region each in `main.rs`, `device.rs` and `action.yml`. This shows where upstream has been editing, not how often a forward merge will conflict (it applies a newer diff to an older tree). Expect hand-resolved conflicts in `session.rs` at most syncs; the more often we sync, the smaller each one.
+- **Clean merges can still break GNOME** (Sol, round 1): a new direct compositor call in `session.rs` or any new server file; a changed type that the `gnome-*` crates share with `hypr-*` (signatures fail to compile, but changed defaults, event order, coordinates, buffer ownership and fallbacks compile and run wrongly); our `FrameSource` in `hypr-capture/src/external.rs` depends on private capture-thread commands; a new protocol message the backend must act on. `gliff-probe` uses `hypr_*` too.
+- **Changes made for this** (Sol's recommendations 1 and 3): the "needs GNOME mirror" check in `scripts/sync-upstream.sh` now covers whole crates (`hypr-*`, `gliff-server`, `gliff`, `gliff-probe`, `gliff-proto`, `gliff-vk`) and the workspace manifests, not a list of file names; and a sync pull request that carries the label stays a draft after green tests, with a comment asking for a check on a GNOME session first (before, passing tests took it out of draft). Not done: running the sync daily instead of weekly, and a first manual run of the workflow (it has still never run; it needs the repository setting named in "M6 result"); both are the owner's call. Not done on purpose: shrinking the `session.rs` diff further (Sol: only incidental churn is worth removing, and a larger abstraction would cost more than it saves).
+- **Merge checklist** for a sync pull request: regenerate `Cargo.lock`; resolve `session.rs` by keeping upstream's behaviour and routing any new compositor call through `Backend`; run `scripts/check.sh`; run the GNOME probes if the PR carries the label.
+
 ### Decisions (2026-11-15)
 
 - No issue is opened upstream; the fork proceeds on its own (MIT licence).
@@ -414,7 +425,7 @@ A private (`--headless`) screen now follows the viewer's scale: `GnomeBackend::s
 This fork merges omacom's `main` regularly, so our features must not make that merge harder.
 
 - New code goes in new crates and new files (`gliff-backend`, `gnome-*`, `hypr_backend.rs`, `backend.rs`, `nix/`, `flake.nix`, `docs/gnome-backend.md`).
-- An upstream-owned file is edited only when there is no other way, with the smallest change that works (one line where possible). No reformatting, renaming or tidying of upstream code. Upstream docs (`README.md`, `docs/architecture.md`, ...) are not edited; GNOME documentation goes in `docs/gnome-backend.md`.
+- An upstream-owned file is edited only when there is no other way, with the smallest change that works (one line where possible). No reformatting, renaming or tidying of upstream code. Upstream docs (`docs/architecture.md`, ...) are not edited, and `README.md` only by the short note listed below; GNOME documentation goes in `docs/gnome-backend.md`.
 - Every upstream-owned file we edit is listed here with the reason. A new entry needs a reason too.
 - `Cargo.lock` is generated: after a merge, regenerate it instead of hand-merging.
 - To see the footprint at any time: `git diff --name-status upstream/main` (`M` rows are upstream files we changed).
@@ -432,6 +443,7 @@ Upstream files edited so far:
 | `crates/hypr-capture/src/lib.rs` | one more variant `Backing::External` of the private enum, a constant, and its arm in `with_mapped` and in `read_bgra` (7 lines; approved 2026-11-19, additive only) | a dmabuf that PipeWire owns has no GBM object and no memfd; the GPU imports it from `DmabufInfo`, the CPU cannot read it. Its constructor `CaptureBuffer::from_dmabuf` is in `external.rs`. |
 | `crates/gliff-vk/src/device.rs` | one new public function `Gpu::dmabuf_modifiers` (about 40 lines, nothing else touched; approved 2026-11-19) | PipeWire's producer picks the modifier, so the consumer must offer the list Vulkan can import; `modifier_properties` is crate-private |
 | `.github/actions/setup/action.yml` | two words added to the pacman package list: `pipewire clang` (approved 2026-11-19, additive only) | CI builds in an Arch container; `gnome-capture` needs libpipewire, and its bindgen needs clang, so CI could not compile the workspace without them |
+| `README.md` | a four-line note under the introduction and one line under Requirements, saying this fork is adding GNOME support (asked for by the fork's owner 2026-11-21, additive only) | so a reader of the fork knows the remote machine may be GNOME; the rest of the README is upstream's and still says Hyprland only |
 | `Cargo.lock` | generated | follows the lines above |
 
 Still to come, and the places most likely to need an upstream edit: the viewer (`crates/gliff/src/keymap.rs`, `net.rs`, `paintable.rs`, M4) and `gliff-probe` (M3 probes go in a new binary or module first).

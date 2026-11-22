@@ -26,10 +26,14 @@ set -euo pipefail
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/omacom/gliff.git}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 
-# Files whose upstream changes need a look at the GNOME side: the Hyprland
-# crates, the server code that talks to the compositor, and the viewer's three
-# files that use hypr_* (see docs/PLAN.md, M4 part 1).
-NEEDS_MIRROR='^crates/hypr-|^crates/gliff-server/src/(session|main|clipboard)\.rs$|^crates/gliff/src/(keymap|net|paintable)\.rs$'
+# Files whose upstream changes need a look at the GNOME side. A clean merge
+# does not mean the GNOME backend still works: a new direct compositor call, a
+# changed type the gnome-* crates share with hypr-*, or a new protocol message
+# the backend must act on all merge without a conflict. So whole crates are
+# listed, not file names: the Hyprland crates, the server, the viewer, the
+# probe, the protocol, the Vulkan crate (it holds our dmabuf code), and the
+# workspace manifests (see docs/PLAN.md, "Upstream sync").
+NEEDS_MIRROR='^crates/(hypr-[^/]+|gliff-server|gliff|gliff-probe|gliff-proto|gliff-vk)/|^Cargo\.(toml|lock)$'
 
 summary=""
 dry_run=0
