@@ -47,6 +47,10 @@ rustPlatform.buildRustPackage {
     install -Dm644 NOTICE "$out/share/licenses/gliff/NOTICE"
     install -Dm644 pkgbuild/gliff.svg "$out/share/icons/hicolor/scalable/apps/gliff.svg"
     install -Dm644 pkgbuild/gliff.desktop "$out/share/applications/gliff.desktop"
+    # The entry is upstream's and names Hyprland only; this fork serves GNOME too.
+    substituteInPlace "$out/share/applications/gliff.desktop" \
+      --replace-fail "a Hyprland session over SSH" "a Hyprland or GNOME session over SSH" \
+      --replace-fail "ssh;hyprland;" "ssh;hyprland;gnome;"
     install -Dm644 docs/hardware-quirks.md "$out/share/doc/gliff/hardware-quirks.md"
   '';
 

@@ -212,10 +212,20 @@ picks the render node through ordinary Wayland protocols. Two GNOME behaviours
 show up when you use it:
 
 - The first time the window takes the keyboard, GNOME Shell asks whether to
-  allow capturing system shortcuts, and asks again on every launch (the
-  viewer has no application id, so GNOME has nothing to remember the answer
-  for). Until you allow it, shortcuts such as Super stay with the local
-  desktop.
+  allow capturing system shortcuts. Until you allow it, shortcuts such as
+  Super stay with the local desktop. GNOME remembers the answer only for an
+  app it can match to a desktop file, and it matches a window that was
+  started through that file: launch gliff from the application grid (the
+  package installs `gliff.desktop`; `gio launch` on the file does the same).
+  Started from a terminal or over ssh as plain `gliff`, GNOME does not match
+  the window to the file and asks again on every launch. No viewer change
+  is needed, and the viewer sets no application id. Checked on the NVIDIA
+  desktop; see "The shortcut prompt on GNOME" in `docs/PLAN.md`.
+- Do not run the viewer and `gliff-server` on the same desktop with the
+  clipboard on: both sides then share one clipboard, each sees the other's
+  copy as new, and the bridge ping-pongs (about 4,600 requests in four
+  minutes, one "Pasting text" notification each). For a one-machine test
+  start the viewer with `--no-clipboard`.
 - A private (`--headless`) screen follows the viewer's scale, as far as
   Mutter allows it (the nearest scale the mode supports, and none that leaves
   under 800x480 logical pixels). Tested on a real NVIDIA GPU; on the
