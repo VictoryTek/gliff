@@ -126,23 +126,24 @@ fn plain(sym: u32) -> u32 {
     }
 }
 
-/// Whether two keymaps give every key the same symbols on every level, in the
-/// first layout.
-fn same_layout(a: &xkb::Keymap, b: &xkb::Keymap) -> bool {
+/// Whether `a`'s first layout gives every key the same symbols, on every
+/// level, as layout `group` of `b`.
+fn same_layout(a: &xkb::Keymap, b: &xkb::Keymap, group: u32) -> bool {
     let lo = a.min_keycode().raw().min(b.min_keycode().raw());
     let hi = a.max_keycode().raw().max(b.max_keycode().raw());
     (lo..=hi).all(|raw| {
         let key = xkb::Keycode::new(raw);
         let levels = a.num_levels_for_key(key, 0);
-        levels == b.num_levels_for_key(key, 0)
-            && (0..levels)
-                .all(|l| a.key_get_syms_by_level(key, 0, l) == b.key_get_syms_by_level(key, 0, l))
+        levels == b.num_levels_for_key(key, group)
+            && (0..levels).all(|l| {
+                a.key_get_syms_by_level(key, 0, l) == b.key_get_syms_by_level(key, group, l)
+            })
     })
 }
 
 #[cfg(test)]
 pub(crate) fn same_layout_for_tests(a: &xkb::Keymap, b: &xkb::Keymap) -> bool {
-    same_layout(a, b)
+    same_layout(a, b, 0)
 }
 
 fn compile(text: &str) -> Option<xkb::Keymap> {
@@ -185,11 +186,15 @@ impl ViewerKeys {
 
     fn mode_for(viewer: &xkb::Keymap, server: Option<&str>) -> Mode {
         match server.and_then(compile) {
-            // With several layouts the one in use is not known here, so the
-            // comparison would be a guess: key codes, as before.
-            Some(server) if server.num_layouts() > 1 => Mode::Codes,
-            Some(server) if !same_layout(viewer, &server) => Mode::Keysyms,
-            _ => Mode::Codes,
+            // Which of the server's layouts is active is not known here. The
+            // viewer's layout can only be trusted as the same when it is one
+            // of them (key codes, as before); when it is none of them, key
+            // codes are certainly wrong and symbols are right in any layout.
+            Some(server) if (0..server.num_layouts()).any(|g| same_layout(viewer, &server, g)) => {
+                Mode::Codes
+            }
+            Some(_) => Mode::Keysyms,
+            None => Mode::Codes,
         }
     }
 

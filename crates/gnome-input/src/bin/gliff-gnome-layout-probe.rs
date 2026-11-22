@@ -9,6 +9,9 @@
 //!
 //! The window covers the screen and takes the pointer and keys for a few
 //! seconds: run it on a machine nobody is using.
+//!
+//! `gliff-gnome-layout-probe [LAYOUT...]` runs only the scenarios for the
+//! named viewer layouts (`us`, `de`, `fr`, `ru`); with none it runs them all.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -351,8 +354,15 @@ fn work(requests: Sender<Request>) -> bool {
     }
     ok("focus", "the text field has the keyboard");
 
+    // Layouts named on the command line limit the scenarios to those (a
+    // server with several layouts cannot pass the ones for a layout it only
+    // has as a second choice).
+    let only: Vec<String> = std::env::args().skip(1).collect();
     let mut healthy = true;
-    for s in SCENARIOS {
+    for s in SCENARIOS
+        .iter()
+        .filter(|s| only.is_empty() || only.iter().any(|l| l == s.layout))
+    {
         let result = (|| -> Result<String, String> {
             input
                 .send(InputCmd::SetKeymap(layout_text(s.layout)?))
@@ -389,6 +399,19 @@ fn work(requests: Sender<Request>) -> bool {
 }
 
 fn main() {
+    // Before a window takes the screen: a name with no scenarios would
+    // silently run fewer (or none) and could report PASS.
+    if let Some(bad) = std::env::args()
+        .skip(1)
+        .find(|l| !SCENARIOS.iter().any(|s| s.layout == l.as_str()))
+    {
+        fail(
+            "argument",
+            format!("{bad:?} is not a layout with scenarios"),
+        );
+        println!("FAIL");
+        std::process::exit(1);
+    }
     if gtk4::init().is_err() {
         println!("[FAIL] gtk: cannot open a display");
         println!("FAIL");

@@ -80,9 +80,9 @@ gliff-gnome-input-probe caps    # taps Caps Lock twice and checks it toggled and
 `move` is checked by reading the pointer back through the capture stream.
 
 Keys go as keycodes, which Mutter reads with the server's layout, as long as
-the viewer's layout is the server's (or the viewer has sent none, or the server
-has several layouts, since the active one is not known here), so nothing
-changes for the common case. The server's layout is read from the compositor
+the viewer's layout is the server's (or the viewer has sent none, or the
+server has several layouts and the viewer's is one of them, since the active
+one is not known here), so nothing changes for the common case. The server's layout is read from the compositor
 (a Wayland keyboard receives the seat's keymap, like the viewer reads its own).
 When the viewer's layout differs, every key goes through the viewer's layout on
 the server and is sent as the keysym it makes there (a German viewer's Y key is
@@ -106,7 +106,17 @@ what the field received:
 
 ```
 gliff-gnome-layout-probe      # run on a machine nobody is using
+gliff-gnome-layout-probe fr   # only the scenarios for the named viewer layouts
 ```
+
+A server with several layouts: the viewer's layout is compared with each of
+them. If it is none of them, key codes would be wrong whichever is active, so
+the keysym mode above is used (Mutter looks the keysym up in the layout in
+use). If it is one of them, key codes are kept, as the active layout is not
+known here, so a viewer on the server's second layout while the first is
+active is typed with the first (not helped; on the test desktop a German
+viewer on a us+de server was typed correctly anyway, see "Several layouts on
+the server" in `docs/PLAN.md`).
 
 ## `gnome-clipboard`
 

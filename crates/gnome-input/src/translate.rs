@@ -958,19 +958,32 @@ mod tests {
     }
 
     #[test]
-    fn a_server_with_several_layouts_keeps_key_codes() {
-        // Which layout is active there is not known, so no comparison.
+    fn a_server_with_several_layouts_keeps_key_codes_for_a_viewer_layout_it_has() {
+        // Which layout is active there is not known, so a viewer on any of
+        // them keeps key codes.
+        for viewer in ["us", "de"] {
+            let mut t = t();
+            t.set_server_keymap(1, Some(layout("us,de")));
+            t.translate(InputCmd::SetKeymap(layout(viewer))).unwrap();
+            assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes), "{viewer}");
+            assert_eq!(
+                key(&mut t, KEY_A, true),
+                [Call::Key {
+                    code: KEY_A,
+                    pressed: true
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_viewer_layout_the_server_does_not_have_sends_symbols_whatever_is_active() {
         let mut t = t();
         t.set_server_keymap(1, Some(layout("us,de")));
         t.translate(InputCmd::SetKeymap(layout("fr"))).unwrap();
-        assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes));
-        assert_eq!(
-            key(&mut t, KEY_A, true),
-            [Call::Key {
-                code: KEY_A,
-                pressed: true
-            }]
-        );
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Keysyms));
+        // The key at the position of A on a French keyboard types q.
+        assert_eq!(key(&mut t, KEY_A, true), [sym(0x71, true)]);
     }
 
     #[test]
