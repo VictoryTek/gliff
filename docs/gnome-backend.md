@@ -143,7 +143,7 @@ blanks the screen on purpose to test the wake, so run it on a test machine.
 
 The monitor exists only while something reads its stream, and Mutter sizes it
 from the format the reader asks for, so a resize is a new format request. The
-virtual monitor is always scale 1.
+virtual monitor takes the viewer's scale (see the limits below).
 
 ## Running the server on GNOME
 
@@ -175,7 +175,8 @@ gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application 
 `serve_probe` is a headless gliff client: it checks the greeting, the first
 frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor, the
 pointer, the cursor shape, resizes and that the monitors are back to normal
-afterwards. It does not decode video.
+afterwards, and with `--headless` the scale (2, 1.5, a 4K window and a
+change at the same size). It does not decode video.
 
 ## The viewer on GNOME
 
@@ -188,10 +189,13 @@ show up when you use it:
   viewer has no application id, so GNOME has nothing to remember the answer
   for). Until you allow it, shortcuts such as Super stay with the local
   desktop.
-- A private (`--headless`) screen is always scale 1, so on a HiDPI display
-  the remote desktop looks small. Mutter can give a virtual monitor another
-  scale, but that crashed GNOME Shell on the software-rendered test VM, so it
-  is off; see the "M4 part 1 result" entry in `docs/PLAN.md`.
+- A private (`--headless`) screen follows the viewer's scale, as far as
+  Mutter allows it (the nearest scale the mode supports, and none that leaves
+  under 800x480 logical pixels). Tested on a real NVIDIA GPU; on the
+  software-rendered test VM a scale of 1.75 crashed GNOME Shell once, so a
+  host without a GPU may do the same. A new scale at the same pixel size is
+  ignored by Mutter until the size changes. See "Scale (HiDPI) on GNOME" in
+  `docs/PLAN.md`.
 
 ## Keeping up with upstream
 

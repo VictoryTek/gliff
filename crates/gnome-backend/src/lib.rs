@@ -275,17 +275,17 @@ impl Backend for GnomeBackend {
         Ok(())
     }
 
-    /// Only the size is applied; a virtual output stays at scale 1 and 60 Hz.
-    /// `VirtualOutput` can ask Mutter for another scale, but it is held back:
-    /// on the software-rendered test VM, creating a 2560x1440 monitor at
-    /// scale 1.75 crashed GNOME Shell and ended the session, and a scale
-    /// change at the same size has no effect. See docs/PLAN.md.
-    fn set_mode(&self, name: &str, width: u32, height: u32, _hz: u32, _scale: f32) -> Result<()> {
+    /// The size and the scale are applied, at 60 Hz. Mutter takes the nearest
+    /// scale the mode supports (none that would leave under 800x480 logical
+    /// pixels), so the session reads the scale back from `list_outputs`. A new
+    /// scale at the same size does nothing on Mutter; the session then keeps
+    /// the scale it had. See docs/PLAN.md.
+    fn set_mode(&self, name: &str, width: u32, height: u32, _hz: u32, scale: f32) -> Result<()> {
         let held = self.held(name).ok_or_else(|| anyhow!("no output {name}"))?;
         let Held::Virtual(v) = held else {
             bail!("{name} is a real monitor; its mode is not changed");
         };
-        v.out.resize(width, height, 1.0)
+        v.out.resize(width, height, f64::from(scale))
     }
 
     fn remove_output(&self, name: &str) -> Result<()> {

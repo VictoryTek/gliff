@@ -37,6 +37,12 @@ struct Seen {
     frames: u64,
     last_frame_id: u64,
     stream: Option<(u32, u32)>,
+    /// The stream's scale x1000 from the last `StreamConfig`.
+    scale_milli: u32,
+    /// `StreamConfig`s seen, and the frames seen when the last one came, so
+    /// a step can wait for its own config and a frame after it.
+    configs: u32,
+    frames_at_config: u64,
     pipeline: Option<gliff_proto::VideoPipeline>,
     cursor_shapes: u32,
     cursor: Option<(f64, f64, bool)>,
@@ -94,9 +100,13 @@ impl Client {
                 width,
                 height,
                 pipeline,
+                scale_milli,
                 ..
             } => {
                 self.seen.stream = Some((*width, *height));
+                self.seen.scale_milli = *scale_milli;
+                self.seen.configs += 1;
+                self.seen.frames_at_config = self.seen.frames;
                 self.seen.pipeline = *pipeline;
             }
             _ => {}
@@ -193,8 +203,8 @@ async fn run(server: &str, extra: &[String], headless: bool, clipboard: Option<u
         keymap: String::new(),
         caps: ClientCaps {
             codecs: vec![Codec::H264],
-            max_width: 1920,
-            max_height: 1080,
+            max_width: 3840,
+            max_height: 2160,
             chroma: vec![ChromaMode::Single420],
             features: features(),
         },
@@ -297,6 +307,93 @@ async fn run(server: &str, extra: &[String], headless: bool, clipboard: Option<u
                     healthy &= fail("resize", format!("{w}x{h}: stream is {:?}", c.seen.stream))
                 }
                 Err(e) => return fail("resize", e),
+            }
+        }
+    }
+
+    if headless {
+        // A HiDPI viewer: 2560x1440 pixels at scale 2 is a 1280x720 desktop.
+        let (w, h) = (2560u32, 1440u32);
+        let resize = ClientMsg::Resize {
+            width: w,
+            height: h,
+            scale: 2.0,
+        };
+        let _ = c.wr.write_msg(&resize).await;
+        let after = c.seen.last_frame_id;
+        let reached = c
+            .until(Duration::from_secs(10), |s| {
+                s.stream == Some((w, h)) && s.last_frame_id > after
+            })
+            .await;
+        match reached {
+            Ok(true) if c.seen.scale_milli == 2000 => ok(
+                "scale 2",
+                format!("stream {w}x{h}, scale {}", c.seen.scale_milli),
+            ),
+            Ok(true) => {
+                healthy &= fail(
+                    "scale 2",
+                    format!("stream {w}x{h} but scale {}", c.seen.scale_milli),
+                )
+            }
+            Ok(false) => healthy &= fail("scale 2", format!("stream is {:?}", c.seen.stream)),
+            Err(e) => return fail("scale 2", e),
+        }
+        // Motion goes in the logical space (1280x720 here); the cursor comes
+        // back in stream pixels, so twice the numbers.
+        let _ =
+            c.wr.write_msg(&ClientMsg::PointerMotion {
+                x: 1200.0,
+                y: 650.0,
+            })
+            .await;
+        let near = |s: &Seen| {
+            s.cursor
+                .is_some_and(|(x, y, _)| (x - 2400.0).abs() < 3.0 && (y - 1300.0).abs() < 3.0)
+        };
+        match c.until(Duration::from_secs(5), near).await {
+            Ok(true) => ok("scale 2 pointer", format!("cursor at {:?}", c.seen.cursor)),
+            Ok(false) => {
+                healthy &= fail("scale 2 pointer", format!("cursor is {:?}", c.seen.cursor))
+            }
+            Err(e) => return fail("scale 2 pointer", e),
+        }
+        // Back to 1 again, a fractional scale (what Mutter makes of it depends
+        // on the desktop), a 4K window at scale 2 and a scale change at the
+        // size it already has (Mutter ignores that one). The stream may be
+        // scaled to the encoder's limit, so only the frames are required.
+        for (w, h, scale) in [
+            (1600u32, 900u32, 1.0f32),
+            (1920, 1080, 1.5),
+            (3840, 2160, 2.0),
+            (1600, 900, 1.0),
+            (1600, 900, 2.0),
+        ] {
+            let resize = ClientMsg::Resize {
+                width: w,
+                height: h,
+                scale,
+            };
+            let _ = c.wr.write_msg(&resize).await;
+            let configs = c.seen.configs;
+            let reached = c
+                .until(Duration::from_secs(10), |s| {
+                    s.configs > configs && s.frames > s.frames_at_config
+                })
+                .await;
+            match reached {
+                Ok(true) => ok(
+                    "scale change",
+                    format!(
+                        "asked {w}x{h} at {scale}: stream {:?} at scale {}",
+                        c.seen.stream, c.seen.scale_milli
+                    ),
+                ),
+                Ok(false) => {
+                    healthy &= fail("scale change", format!("{w}x{h} at {scale}: no frames"))
+                }
+                Err(e) => return fail("scale change", e),
             }
         }
     }
