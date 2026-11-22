@@ -176,7 +176,14 @@ gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application 
 frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor, the
 pointer, the cursor shape, resizes and that the monitors are back to normal
 afterwards, and with `--headless` the scale (2, 1.5, a 4K window and a
-change at the same size). It does not decode video.
+change at the same size). It does not decode video. With `--rich-clipboard` it
+also moves an image, two files (one of 3 MB) and a folder through the server's
+clipboard in both directions, with a plain Mutter client playing the desktop's
+applications (it replaces the desktop's clipboard while it runs):
+
+```
+serve_probe target/debug/gliff-server --headless --rich-clipboard
+```
 
 ## The viewer on GNOME
 

@@ -9,14 +9,21 @@
 //! `gliff-gnome-clipboard-probe watch` or `serve` beside it to see both
 //! directions.
 //!
+//! With `--rich-clipboard` the client also moves an image, two files (one of
+//! 3 MB, so it takes several chunks) and a folder with a file in it through
+//! the server's clipboard both ways, with a plain Mutter client playing the desktop's applications. It
+//! replaces the desktop's clipboard: run it where that is fine.
+//!
 //! One line per check, `[ OK ]` or `[FAIL]`. It does not decode video: it
 //! checks that frames of the announced size arrive and are acknowledged.
 
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use gliff_proto::{
-    features, ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, PROTOCOL_VERSION,
+    features, ChromaMode, ClientCaps, ClientMsg, ClipboardFile, ClipboardItem, Codec, ServerMsg,
+    PROTOCOL_VERSION,
 };
 use gliff_transport::Framed;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -48,6 +55,24 @@ struct Seen {
     cursor: Option<(f64, f64, bool)>,
     /// Selections the server reported, by mime types.
     offers: Vec<Vec<String>>,
+    /// The last offer's serial and files.
+    offer_serial: u32,
+    offer_files: Vec<ClipboardFile>,
+    /// Clipboard data the server sent, by request id, and the ids whose last
+    /// chunk came.
+    incoming: HashMap<u32, Vec<u8>>,
+    finished: HashSet<u32>,
+    /// Requests the server made of us (id, serial, item), not yet answered,
+    /// and the most each of our answers has been acknowledged up to.
+    requests: Vec<(u32, u32, ClipboardItem)>,
+    acks: HashMap<u32, u64>,
+    /// Bytes of each answer of ours sent so far, ids the server aborted, the
+    /// serial of the offer we made (requests must name it) and everything the
+    /// server did that the protocol does not allow.
+    sent: HashMap<u32, u64>,
+    aborted: HashSet<u32>,
+    my_serial: Option<u32>,
+    violations: Vec<String>,
 }
 
 struct Client {
@@ -93,8 +118,70 @@ impl Client {
             ServerMsg::CursorPos { x, y, visible, .. } => {
                 self.seen.cursor = Some((*x, *y, *visible));
             }
-            ServerMsg::ClipboardOffer { mime_types, .. } => {
+            ServerMsg::ClipboardOffer {
+                serial,
+                mime_types,
+                files,
+            } => {
                 self.seen.offers.push(mime_types.clone());
+                self.seen.offer_serial = *serial;
+                self.seen.offer_files = files.clone();
+            }
+            ServerMsg::ClipboardData {
+                id,
+                offset,
+                data_len,
+                done,
+            } => {
+                let chunk = self
+                    .rd
+                    .read_payload(*data_len)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let got = self.seen.incoming.entry(*id).or_default();
+                if *offset != got.len() as u64 {
+                    self.seen.violations.push(format!(
+                        "chunk of request {id} at offset {offset}, expected {}",
+                        got.len()
+                    ));
+                }
+                if chunk.len() > 256 * 1024 {
+                    self.seen
+                        .violations
+                        .push(format!("chunk of request {id} is {} bytes", chunk.len()));
+                }
+                got.extend_from_slice(&chunk);
+                let received = got.len() as u64;
+                if *done {
+                    self.seen.finished.insert(*id);
+                } else {
+                    let ack = ClientMsg::ClipboardAck { id: *id, received };
+                    self.wr.write_msg(&ack).await.map_err(|e| e.to_string())?;
+                }
+            }
+            ServerMsg::ClipboardRequest { id, serial, item } => {
+                // The server's ids are even, and it must name our offer.
+                if id % 2 != 0 || self.seen.my_serial.is_some_and(|m| m != *serial) {
+                    self.seen.violations.push(format!(
+                        "request {id} for serial {serial} (ours is {:?})",
+                        self.seen.my_serial
+                    ));
+                } else {
+                    self.seen.requests.push((*id, *serial, item.clone()));
+                }
+            }
+            ServerMsg::ClipboardAck { id, received } => {
+                if *received > self.seen.sent.get(id).copied().unwrap_or(0) {
+                    self.seen.violations.push(format!(
+                        "ack of {received} bytes for request {id}, which got {:?}",
+                        self.seen.sent.get(id)
+                    ));
+                }
+                let at = self.seen.acks.entry(*id).or_default();
+                *at = (*at).max(*received);
+            }
+            ServerMsg::ClipboardAbort { id } => {
+                self.seen.aborted.insert(*id);
             }
             ServerMsg::StreamConfig {
                 width,
@@ -157,11 +244,24 @@ async fn main() {
         clipboard = extra.get(i + 1).and_then(|s| s.parse::<u64>().ok());
         extra.drain(i..(i + 2).min(extra.len()));
     }
-    let healthy = run(&server, &extra, headless, clipboard).await;
+    let rich = match extra.iter().position(|a| a == "--rich-clipboard") {
+        Some(i) => {
+            extra.remove(i);
+            true
+        }
+        None => false,
+    };
+    let healthy = run(&server, &extra, headless, clipboard, rich).await;
     std::process::exit(if healthy { 0 } else { 1 });
 }
 
-async fn run(server: &str, extra: &[String], headless: bool, clipboard: Option<u64>) -> bool {
+async fn run(
+    server: &str,
+    extra: &[String],
+    headless: bool,
+    clipboard: Option<u64>,
+    rich: bool,
+) -> bool {
     let before = match monitor_names() {
         Ok(n) => n,
         Err(e) => return fail("monitors", e),
@@ -398,7 +498,14 @@ async fn run(server: &str, extra: &[String], headless: bool, clipboard: Option<u
         }
     }
 
-    if let Some(secs) = clipboard {
+    // After a failed rich check the stream may be in the middle of a message:
+    // the text offer below is skipped, and the serial the rich check made the
+    // server's requests name no longer applies.
+    let rich_ok = !rich || rich_clipboard(&mut c).await;
+    healthy &= rich_ok;
+    c.seen.my_serial = None;
+
+    if let Some(secs) = clipboard.filter(|_| rich_ok) {
         let offer = ClientMsg::ClipboardOffer {
             serial: 1,
             mime_types: vec!["text/plain;charset=utf-8".into()],
@@ -456,6 +563,597 @@ async fn run(server: &str, extra: &[String], headless: bool, clipboard: Option<u
         for l in interesting {
             println!("  {l}");
         }
+    }
+    healthy
+}
+
+// ---- the rich clipboard check ------------------------------------------
+
+const PNG: &str = "image/png";
+const TEXT: &str = "text/plain;charset=utf-8";
+const URI_LIST: &str = "text/uri-list";
+const GNOME_FILES: &str = "x-special/gnome-copied-files";
+
+/// Bytes that do not repeat, so a chunk in the wrong place is noticed.
+fn blob(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// A plain Mutter clipboard client: it plays the desktop's applications, with
+/// none of the bridge's rules.
+struct App {
+    _session: gnome_ipc::Session,
+    port: gnome_ipc::ClipboardPort,
+    selections: std::sync::mpsc::Receiver<Vec<String>>,
+    payloads: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl App {
+    fn start() -> Result<App, String> {
+        let e = |e: anyhow::Error| format!("{e:#}");
+        let address = gnome_ipc::find_session().map_err(e)?.bus_address;
+        let session = gnome_ipc::Session::create_remote_only(&address).map_err(e)?;
+        let (port, signals) = session.enable_clipboard().map_err(e)?;
+        session.start().map_err(e)?;
+        let payloads: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
+            Default::default();
+        let (tx, selections) = std::sync::mpsc::channel();
+        {
+            let (port, payloads) = (port.clone(), payloads.clone());
+            std::thread::spawn(move || {
+                while let Ok(signal) = signals.recv() {
+                    match signal {
+                        gnome_ipc::ClipboardSignal::OwnerChanged {
+                            mime_types,
+                            is_owner: false,
+                        } => {
+                            let _ = tx.send(mime_types);
+                        }
+                        gnome_ipc::ClipboardSignal::OwnerChanged { .. } => {}
+                        gnome_ipc::ClipboardSignal::Transfer { mime_type, serial } => {
+                            use std::io::Write;
+                            let data = payloads.lock().unwrap().get(&mime_type).cloned();
+                            let done = match data {
+                                Some(data) => port
+                                    .selection_write(serial)
+                                    .and_then(gnome_clipboard::into_blocking)
+                                    .map(|fd| std::fs::File::from(fd).write_all(&data).is_ok())
+                                    .unwrap_or(false),
+                                None => false,
+                            };
+                            let _ = port.selection_write_done(serial, done);
+                        }
+                    }
+                }
+            });
+        }
+        Ok(App {
+            _session: session,
+            port,
+            selections,
+            payloads,
+        })
+    }
+
+    fn offer(&self, items: &[(&str, Vec<u8>)]) {
+        let mut types = Vec::new();
+        for (mime, data) in items {
+            self.payloads
+                .lock()
+                .unwrap()
+                .insert(mime.to_string(), data.clone());
+            types.push(mime.to_string());
+        }
+        let _ = self.port.set_selection(&types);
+    }
+
+    /// The selection's data in `mime`, as an application pasting would read it.
+    fn paste(port: gnome_ipc::ClipboardPort, mime: String) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let fd = port
+            .selection_read(&mime)
+            .and_then(gnome_clipboard::into_blocking)
+            .map_err(|e| format!("{e:#}"))?;
+        let mut out = Vec::new();
+        std::fs::File::from(fd)
+            .read_to_end(&mut out)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+}
+
+impl Client {
+    /// Ask the server for `item` of its offer `serial` and collect the data,
+    /// within 30 s in all (a write or a half-sent payload included). After an
+    /// error the stream may be in the middle of a message: do not go on.
+    async fn fetch(
+        &mut self,
+        id: u32,
+        serial: u32,
+        item: ClipboardItem,
+    ) -> Result<Vec<u8>, String> {
+        timeout(Duration::from_secs(30), self.fetch_inner(id, serial, item))
+            .await
+            .map_err(|_| format!("request {id}: not finished in 30 s"))?
+    }
+
+    async fn fetch_inner(
+        &mut self,
+        id: u32,
+        serial: u32,
+        item: ClipboardItem,
+    ) -> Result<Vec<u8>, String> {
+        let req = ClientMsg::ClipboardRequest { id, serial, item };
+        self.wr.write_msg(&req).await.map_err(|e| e.to_string())?;
+        self.until(Duration::from_secs(30), |s| {
+            s.finished.contains(&id) || s.aborted.contains(&id) || !s.violations.is_empty()
+        })
+        .await?;
+        if let Some(v) = self.seen.violations.first() {
+            return Err(format!("protocol violation by the server: {v}"));
+        }
+        if self.seen.aborted.contains(&id) {
+            return Err(format!("request {id}: the server aborted it"));
+        }
+        if !self.seen.finished.contains(&id) {
+            return Err(format!("request {id}: no final chunk in 30 s"));
+        }
+        Ok(self.seen.incoming.remove(&id).unwrap_or_default())
+    }
+
+    /// Answer the server's requests with `give` until `done` hands back the
+    /// result of the paste they are for. Fails after 30 s in all (writes and
+    /// half-sent payloads included), at once when the server breaks the
+    /// protocol or aborts a transfer. After an error the stream may be in the
+    /// middle of a message: do not go on.
+    async fn answer<T>(
+        &mut self,
+        give: &dyn Fn(&ClipboardItem) -> Option<Vec<u8>>,
+        done: impl FnMut() -> Option<T>,
+    ) -> Result<T, String> {
+        timeout(Duration::from_secs(30), self.answer_inner(give, done))
+            .await
+            .map_err(|_| "no answer to the paste in 30 s".to_string())?
+    }
+
+    async fn answer_inner<T>(
+        &mut self,
+        give: &dyn Fn(&ClipboardItem) -> Option<Vec<u8>>,
+        mut done: impl FnMut() -> Option<T>,
+    ) -> Result<T, String> {
+        loop {
+            if let Some(v) = self.seen.violations.first() {
+                return Err(format!("protocol violation by the server: {v}"));
+            }
+            if !self.seen.aborted.is_empty() {
+                return Err(format!(
+                    "the server aborted transfer(s) {:?}",
+                    self.seen.aborted
+                ));
+            }
+            if let Some(result) = done() {
+                return Ok(result);
+            }
+            self.step(Duration::from_millis(50)).await?;
+            while let Some((id, _serial, item)) = self.seen.requests.pop() {
+                let Some(data) = give(&item) else {
+                    let _ = self.wr.write_msg(&ClientMsg::ClipboardAbort { id }).await;
+                    continue;
+                };
+                self.send_chunks(id, &data).await?;
+            }
+        }
+    }
+
+    /// Send `data` as the answer to request `id`, at most a window of chunks
+    /// ahead of what the server has acknowledged.
+    async fn send_chunks(&mut self, id: u32, data: &[u8]) -> Result<(), String> {
+        const CHUNK: usize = 256 * 1024;
+        const WINDOW: usize = 4;
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHUNK).collect()
+        };
+        let mut offset = 0u64;
+        for (n, chunk) in chunks.iter().enumerate() {
+            // The chunk n - WINDOW must be acknowledged before chunk n goes.
+            if n >= WINDOW {
+                let need: u64 = chunks[..n - WINDOW + 1]
+                    .iter()
+                    .map(|c| c.len() as u64)
+                    .sum();
+                let end = Instant::now() + Duration::from_secs(10);
+                while self.seen.acks.get(&id).copied().unwrap_or(0) < need {
+                    if Instant::now() > end {
+                        return Err(format!("request {id}: no acknowledgement of {need} bytes"));
+                    }
+                    if self.seen.aborted.contains(&id) {
+                        return Err(format!("request {id}: the server aborted it"));
+                    }
+                    self.step(Duration::from_millis(50)).await?;
+                }
+            }
+            let msg = ClientMsg::ClipboardData {
+                id,
+                offset,
+                data_len: chunk.len() as u32,
+                done: n + 1 == chunks.len(),
+            };
+            offset += chunk.len() as u64;
+            self.seen.sent.insert(id, offset);
+            self.wr
+                .write_msg_with_payloads(&msg, &[chunk])
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// A directory that goes away with the value, on every way out.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn file_urls(dir: &std::path::Path, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| format!("file://{}", dir.join(n).display()))
+        .collect()
+}
+
+/// Read the selection's `mime` as an application would, on a thread of its
+/// own: the result comes on the channel. A read the server never answers
+/// leaves its thread blocked until the probe exits; the probe does not wait
+/// for it.
+fn paste_in_background(
+    port: &gnome_ipc::ClipboardPort,
+    mime: &str,
+) -> std::sync::mpsc::Receiver<Result<Vec<u8>, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (port, mime) = (port.clone(), mime.to_string());
+    std::thread::spawn(move || {
+        let _ = tx.send(App::paste(port, mime));
+    });
+    rx
+}
+
+/// The result of a background paste, once there is one.
+fn paste_result(
+    rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+) -> Option<Result<Vec<u8>, String>> {
+    match rx.try_recv() {
+        Ok(r) => Some(r),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Some(Err("the paste thread died".into()))
+        }
+    }
+}
+
+/// The entries an offer of the test files must list, sorted: exactly these,
+/// each once.
+fn expected_entries(note: &[u8], big: &[u8], inner: &[u8]) -> Vec<(String, u64, bool)> {
+    let mut v = vec![
+        ("note.txt".to_string(), note.len() as u64, false),
+        ("big.bin".to_string(), big.len() as u64, false),
+        ("pack".to_string(), 0, true),
+        ("pack/inner.txt".to_string(), inner.len() as u64, false),
+    ];
+    v.sort();
+    v
+}
+
+fn entry_set(files: &[ClipboardFile]) -> Vec<(String, u64, bool)> {
+    let mut v: Vec<_> = files
+        .iter()
+        .map(|f| (f.path.clone(), f.size, f.dir))
+        .collect();
+    v.sort();
+    v
+}
+
+/// An image, text, two files and a folder through the server's clipboard, both
+/// ways.
+async fn rich_clipboard(c: &mut Client) -> bool {
+    let mut healthy = true;
+    let dir = TempDir(std::env::temp_dir().join(format!("gliff-rich-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    let png = blob(200_000, 1);
+    let note = b"a small file\nwith two lines\n".to_vec();
+    let big = blob(3_000_000, 2);
+    let inner = b"inside a folder\n".to_vec();
+    if std::fs::create_dir_all(dir.0.join("pack")).is_err()
+        || std::fs::write(dir.0.join("note.txt"), &note).is_err()
+        || std::fs::write(dir.0.join("big.bin"), &big).is_err()
+        || std::fs::write(dir.0.join("pack/inner.txt"), &inner).is_err()
+    {
+        return fail("rich clipboard", "cannot write the test files");
+    }
+    let app = match App::start() {
+        Ok(a) => a,
+        Err(e) => return fail("rich clipboard", format!("desktop client: {e}")),
+    };
+    let want_entries = expected_entries(&note, &big, &inner);
+
+    // 1. The desktop copies an image, text and files; the viewer sees the
+    // offer and fetches each item.
+    let urls = file_urls(&dir.0, &["note.txt", "big.bin", "pack"]);
+    let uri_body = urls.join("\r\n") + "\r\n";
+    let gnome_body = format!("copy\n{}", urls.join("\n"));
+    app.offer(&[
+        (PNG, png.clone()),
+        (TEXT, b"hello from the desktop".to_vec()),
+        (URI_LIST, uri_body.clone().into_bytes()),
+        (GNOME_FILES, gnome_body.into_bytes()),
+    ]);
+    let seen = c
+        .until(Duration::from_secs(10), |s| {
+            s.offers.iter().any(|o| o.iter().any(|m| m == PNG)) && !s.offer_files.is_empty()
+        })
+        .await;
+    if !matches!(seen, Ok(true)) {
+        return fail(
+            "desktop offer",
+            format!(
+                "offers {:?}, files {:?} ({seen:?})",
+                c.seen.offers, c.seen.offer_files
+            ),
+        );
+    }
+    let types = c.seen.offers.last().cloned().unwrap_or_default();
+    let has = |m: &str| types.iter().any(|t| t == m);
+    if has(PNG)
+        && has(TEXT)
+        && !has(URI_LIST)
+        && !has(GNOME_FILES)
+        && entry_set(&c.seen.offer_files) == want_entries
+    {
+        ok(
+            "desktop offer",
+            format!("{types:?}, entries {:?}", entry_set(&c.seen.offer_files)),
+        );
+    } else {
+        return fail(
+            "desktop offer",
+            format!(
+                "types {types:?}, entries {:?}, wanted {want_entries:?}",
+                entry_set(&c.seen.offer_files)
+            ),
+        );
+    }
+    let serial = c.seen.offer_serial;
+    let files = c.seen.offer_files.clone();
+    // Request ids: the client's are odd.
+    let mut next_id = 1u32;
+    let mut id = || {
+        next_id += 2;
+        next_id - 2
+    };
+    match c.fetch(id(), serial, ClipboardItem::Mime(PNG.into())).await {
+        Ok(got) if got == png => ok("desktop image", format!("{} bytes intact", got.len())),
+        Ok(got) => {
+            healthy &= fail(
+                "desktop image",
+                format!("{} bytes, not the image", got.len()),
+            )
+        }
+        Err(e) => return fail("desktop image", e),
+    }
+    match c
+        .fetch(id(), serial, ClipboardItem::Mime(TEXT.into()))
+        .await
+    {
+        Ok(got) if got == b"hello from the desktop" => ok("desktop text", "intact"),
+        Ok(got) => healthy &= fail("desktop text", format!("{got:?}")),
+        Err(e) => return fail("desktop text", e),
+    }
+    for (index, file) in files.iter().enumerate() {
+        if file.dir {
+            continue;
+        }
+        let want = match file.path.as_str() {
+            "note.txt" => &note,
+            "big.bin" => &big,
+            "pack/inner.txt" => &inner,
+            other => {
+                healthy &= fail("desktop file", format!("unexpected entry {other}"));
+                continue;
+            }
+        };
+        match c
+            .fetch(id(), serial, ClipboardItem::File(index as u32))
+            .await
+        {
+            Ok(got) if &got == want => ok(
+                "desktop file",
+                format!("{} ({} bytes) intact", file.path, got.len()),
+            ),
+            Ok(got) => {
+                healthy &= fail(
+                    "desktop file",
+                    format!("{}: {} bytes, wrong", file.path, got.len()),
+                )
+            }
+            Err(e) => return fail("desktop file", format!("{}: {e}", file.path)),
+        }
+    }
+
+    // 1b. A copy that offers only the GNOME file-list type (what the file
+    // manager does first) is read through that type alone.
+    // It names only the note and the folder, so its entries differ from the
+    // first copy's and a late repeat of that one cannot pass for it.
+    let gnome_only = format!(
+        "copy\n{}",
+        file_urls(&dir.0, &["note.txt", "pack"]).join("\n")
+    );
+    let mut want_gnome = want_entries.clone();
+    want_gnome.retain(|(path, _, _)| path != "big.bin");
+    app.offer(&[(GNOME_FILES, gnome_only.into_bytes())]);
+    let seen = c
+        .until(Duration::from_secs(10), |s| {
+            entry_set(&s.offer_files) == want_gnome
+        })
+        .await;
+    if matches!(seen, Ok(true)) {
+        ok(
+            "desktop files, gnome type only",
+            format!("{:?}", entry_set(&c.seen.offer_files)),
+        );
+    } else {
+        healthy &= fail(
+            "desktop files, gnome type only",
+            format!("{seen:?}, entries {:?}", entry_set(&c.seen.offer_files)),
+        );
+    }
+
+    // 2. The viewer copies the same things; applications on the desktop see
+    // the offer and paste each type.
+    while app.selections.try_recv().is_ok() {}
+    c.seen.my_serial = Some(77);
+    let entries = vec![
+        ClipboardFile {
+            path: "note.txt".into(),
+            size: note.len() as u64,
+            dir: false,
+        },
+        ClipboardFile {
+            path: "big.bin".into(),
+            size: big.len() as u64,
+            dir: false,
+        },
+        ClipboardFile {
+            path: "pack".into(),
+            size: 0,
+            dir: true,
+        },
+        ClipboardFile {
+            path: "pack/inner.txt".into(),
+            size: inner.len() as u64,
+            dir: false,
+        },
+    ];
+    let offer = ClientMsg::ClipboardOffer {
+        serial: 77,
+        mime_types: vec![PNG.into(), TEXT.into()],
+        files: entries,
+    };
+    let _ = c.wr.write_msg(&offer).await;
+    let types = loop {
+        match app.selections.recv_timeout(Duration::from_secs(10)) {
+            Ok(t) if t.iter().any(|m| m == PNG) => break t,
+            Ok(_) => continue,
+            Err(_) => return fail("viewer offer", "the desktop never saw the offer"),
+        }
+    };
+    let has = |m: &str| types.iter().any(|t| t == m);
+    if has(PNG) && has(TEXT) && has(URI_LIST) && has(GNOME_FILES) {
+        ok("viewer offer", format!("{types:?}"));
+    } else {
+        healthy &= fail("viewer offer", format!("{types:?}"));
+    }
+
+    let (png2, note2, big2, inner2) = (png.clone(), note.clone(), big.clone(), inner.clone());
+    let give = move |item: &ClipboardItem| match item {
+        ClipboardItem::Mime(m) if m == PNG => Some(png2.clone()),
+        ClipboardItem::Mime(m) if m == TEXT => Some(b"hello from the viewer".to_vec()),
+        ClipboardItem::File(0) => Some(note2.clone()),
+        ClipboardItem::File(1) => Some(big2.clone()),
+        ClipboardItem::File(3) => Some(inner2.clone()),
+        _ => None,
+    };
+    for (label, mime) in [("image", PNG), ("text", TEXT)] {
+        let rx = paste_in_background(&app.port, mime);
+        match c.answer(&give, || paste_result(&rx)).await {
+            Ok(Ok(got)) if mime == PNG && got == png => {
+                ok("viewer image", format!("{} bytes intact", got.len()))
+            }
+            Ok(Ok(got)) if mime == TEXT && got == b"hello from the viewer" => {
+                ok("viewer text", "intact")
+            }
+            Ok(Ok(got)) => {
+                healthy &= fail(
+                    &format!("viewer {label}"),
+                    format!("{} bytes, wrong", got.len()),
+                )
+            }
+            Ok(Err(e)) | Err(e) => return fail(&format!("viewer {label}"), e),
+        }
+    }
+    // Files: the server fetches them into a spool and answers with a list of
+    // paths there, the same list for both types.
+    for mime in [URI_LIST, GNOME_FILES] {
+        let rx = paste_in_background(&app.port, mime);
+        let body = match c.answer(&give, || paste_result(&rx)).await {
+            Ok(Ok(b)) => String::from_utf8_lossy(&b).into_owned(),
+            Ok(Err(e)) | Err(e) => return fail("viewer files", format!("{mime}: {e}")),
+        };
+        let paths = gliff_proto::clipboard::parse_uri_list(&body);
+        let mut names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        names.sort();
+        let mut good = names == ["big.bin", "note.txt", "pack"];
+        for path in &paths {
+            good &= match path.file_name().and_then(|n| n.to_str()) {
+                Some("note.txt") => std::fs::read(path).ok().as_deref() == Some(&note[..]),
+                Some("big.bin") => std::fs::read(path).ok().as_deref() == Some(&big[..]),
+                Some("pack") => {
+                    path.is_dir()
+                        && std::fs::read(path.join("inner.txt")).ok().as_deref() == Some(&inner[..])
+                }
+                _ => false,
+            };
+        }
+        if mime == GNOME_FILES {
+            good &= body.starts_with("copy\n");
+        }
+        if good {
+            ok(
+                "viewer files",
+                format!(
+                    "{mime}: {names:?} intact at {:?}",
+                    paths.first().and_then(|p| p.parent())
+                ),
+            );
+        } else {
+            healthy &= fail("viewer files", format!("{mime}: {body:?}"));
+        }
+    }
+    // Let a late abort or a late bad message arrive before judging.
+    match timeout(
+        Duration::from_secs(5),
+        c.until(Duration::from_millis(500), |_| false),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => healthy &= fail("clipboard protocol", format!("read failed: {e}")),
+        Err(_) => healthy &= fail("clipboard protocol", "a late message never finished"),
+    }
+    if !c.seen.aborted.is_empty() {
+        healthy &= fail(
+            "clipboard protocol",
+            format!("the server aborted transfer(s) {:?}", c.seen.aborted),
+        );
+    }
+    if let Some(v) = c.seen.violations.first() {
+        healthy &= fail(
+            "clipboard protocol",
+            format!("{} violation(s), the first: {v}", c.seen.violations.len()),
+        );
     }
     healthy
 }
