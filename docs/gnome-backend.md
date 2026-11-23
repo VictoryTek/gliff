@@ -216,7 +216,9 @@ and the picture size, not motion, sharpness or timing. `--decode-gpu` (with
 recombine, read back); a debug build run outside the package needs the Vulkan
 loader on `LD_LIBRARY_PATH`, which the packaged binaries have built in. A
 change of the stream that only paces it (the frame-rate cap) keeps the decoder,
-as the viewer does. With `--rich-clipboard` it
+as the viewer does, and a quiet stream has the CPU decoder drained as the
+viewer's idle drain does. With `--headless` the colour is also required after
+each resize and scale step (`decoded after ...`), at the new stream size. With `--rich-clipboard` it
 also moves an image, two files (one of 3 MB) and a folder through the server's
 clipboard in both directions, with a plain Mutter client playing the desktop's
 applications (it replaces the desktop's clipboard while it runs):
@@ -277,6 +279,13 @@ show up when you use it:
   copy as new, and the bridge ping-pongs (about 4,600 requests in four
   minutes, one "Pasting text" notification each). For a one-machine test
   start the viewer with `--no-clipboard`.
+- Windows on a private screen can be moved off it when its mode changes (a
+  resize or scale change of the viewer). Seen with the fullscreen test window
+  of `gliff-gnome-animate` on a desktop that also has physical monitors: Mutter
+  put it on another monitor in most steps, and the tool, given the monitor's
+  name, puts itself back and counts the times (6 to 13 in a run of nine steps).
+  Not checked with ordinary windows, or on a host whose only monitor is the
+  private screen.
 - A private (`--headless`) screen follows the viewer's scale, as far as
   Mutter allows it (the nearest scale the mode supports, and none that leaves
   under 800x480 logical pixels). Tested on a real NVIDIA GPU; on the

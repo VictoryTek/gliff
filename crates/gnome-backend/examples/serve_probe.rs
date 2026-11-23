@@ -77,6 +77,21 @@ impl PictureDecoder {
                 .map_err(|e| e.to_string()),
         }
     }
+
+    /// The picture a quiet stream leaves inside the decoder. The CPU decoder
+    /// holds the first picture of a stream back until the next unit; the
+    /// viewer flushes it after 150 ms without one (`IDLE_DRAIN`), and so must
+    /// we, or a still screen is seen one picture late. The GPU decoder holds
+    /// nothing.
+    fn drain(&mut self) -> Result<Option<Picture>, String> {
+        match self {
+            Self::Cpu(d) if d.has_pending() => d
+                .flush()
+                .map(|f| f.map(|f| ((f.width, f.height), f.pixels)))
+                .map_err(|e| e.to_string()),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -102,6 +117,11 @@ struct Seen {
     decoder: Option<PictureDecoder>,
     /// What the decoder was made for: chroma mode and stream size.
     decoder_for: Option<(ChromaMode, u32, u32)>,
+    /// Pictures decoded when the last `StreamConfig` came, so a check after
+    /// a step can require a picture from after it, and when the last video
+    /// frame arrived (the viewer's idle drain counts quiet from there).
+    decoded_at_config: u64,
+    last_video: Option<Instant>,
     decoded: Option<((u32, u32), [f64; 3])>,
     decoded_count: u64,
     decode_errors: Vec<String>,
@@ -140,10 +160,46 @@ struct Client {
 }
 
 impl Client {
+    /// Note a decoded picture, or a decode error.
+    fn note_picture(&mut self, decoded: Result<Option<Picture>, String>) {
+        match decoded {
+            Ok(Some(((w, h), px))) => {
+                self.seen.decoded_count += 1;
+                self.seen.decoded = Some(((w, h), middle_colour(&px, w, h)));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if self.seen.decode_errors.len() < 5 {
+                    self.seen.decode_errors.push(e);
+                }
+            }
+        }
+    }
+
+    /// The viewer's idle drain: 150 ms without a video frame (whatever else
+    /// arrives meanwhile) releases the picture the CPU decoder holds back.
+    fn drain_if_quiet(&mut self) {
+        const IDLE_DRAIN: Duration = Duration::from_millis(150);
+        let quiet = self
+            .seen
+            .last_video
+            .is_none_or(|t| t.elapsed() >= IDLE_DRAIN);
+        if !quiet {
+            return;
+        }
+        let drained = self.seen.decoder.as_mut().map(PictureDecoder::drain);
+        if let Some(drained) = drained {
+            self.note_picture(drained);
+        }
+    }
+
     /// Read one message (and its payload), acknowledging video frames.
     async fn step(&mut self, wait: Duration) -> Result<Option<ServerMsg>, String> {
         let msg = match timeout(wait, self.rd.read_msg::<ServerMsg>()).await {
-            Err(_) => return Ok(None),
+            Err(_) => {
+                self.drain_if_quiet();
+                return Ok(None);
+            }
             Ok(Err(e)) => return Err(format!("{e}")),
             Ok(Ok(m)) => m,
         };
@@ -162,19 +218,10 @@ impl Client {
                     .map_err(|e| e.to_string())?;
                 if let Some(decoder) = self.seen.decoder.as_mut() {
                     let (main, aux) = payload.split_at(*data_len as usize);
-                    match decoder.decode(main, aux) {
-                        Ok(Some(((w, h), px))) => {
-                            self.seen.decoded_count += 1;
-                            self.seen.decoded = Some(((w, h), middle_colour(&px, w, h)));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            if self.seen.decode_errors.len() < 5 {
-                                self.seen.decode_errors.push(e);
-                            }
-                        }
-                    }
+                    let decoded = decoder.decode(main, aux);
+                    self.note_picture(decoded);
                 }
+                self.seen.last_video = Some(Instant::now());
                 self.seen.frames += 1;
                 self.seen.frames_since_config += 1;
                 if *keyframe && self.seen.first_key_since_config.is_none() {
@@ -280,6 +327,7 @@ impl Client {
             } => {
                 self.seen.frames_since_config = 0;
                 self.seen.first_key_since_config = None;
+                self.seen.decoded_at_config = self.seen.decoded_count;
                 // As the viewer does: a change that only paces the stream (the
                 // frame-rate cap) keeps the decoder; a change of the coded
                 // stream makes a new one.
@@ -316,6 +364,7 @@ impl Client {
             }
             _ => {}
         }
+        self.drain_if_quiet();
         Ok(Some(msg))
     }
 
@@ -377,6 +426,48 @@ fn colour_matches(got: [f64; 3], want: [u8; 3], tolerance: f64) -> bool {
     got.iter()
         .zip(want)
         .all(|(g, w)| (g - f64::from(w)).abs() <= tolerance)
+}
+
+/// With `--decode`, after a change of the stream: the decoded picture is the
+/// screen's colour again, at the stream's size within 10 s. (A change of the
+/// coded stream makes a new decoder, which needs a keyframe first.)
+async fn decode_follows(c: &mut Client, want: Option<[u8; 3]>, what: &str) -> bool {
+    let Some(want) = want else { return true };
+    // A picture decoded after the step's StreamConfig: one left from before
+    // (a same-size scale change keeps the decoder and the picture) would
+    // satisfy the colour without showing anything about the step.
+    let hit = |s: &Seen| {
+        s.decoded_count > s.decoded_at_config
+            && s.decoded
+                .is_some_and(|(size, m)| s.stream == Some(size) && colour_matches(m, want, 16.0))
+    };
+    let name = format!("decoded after {what}");
+    match c.until(Duration::from_secs(10), hit).await {
+        Ok(true) => {
+            let (size, m) = c.seen.decoded.unwrap_or_default();
+            ok(
+                &name,
+                format!(
+                    "{size:?}, middle rgb ({:.0}, {:.0}, {:.0})",
+                    m[0], m[1], m[2]
+                ),
+            );
+            true
+        }
+        Ok(false) => fail(
+            &name,
+            format!(
+                "stream {:?}, last {:?}; errors {:?}; {} stream config(s), {} frame(s) since the last, first keyframe among them at {:?}",
+                c.seen.stream,
+                c.seen.decoded,
+                c.seen.decode_errors,
+                c.seen.configs,
+                c.seen.frames_since_config,
+                c.seen.first_key_since_config
+            ),
+        ),
+        Err(e) => fail(&name, e),
+    }
 }
 
 fn monitor_names() -> Result<Vec<String>, String> {
@@ -718,6 +809,8 @@ async fn run(
                 }
                 Err(e) => return fail("resize", e),
             }
+            healthy &=
+                decode_follows(&mut c, decode.map(|d| d.0), &format!("resize to {w}x{h}")).await;
         }
     }
 
@@ -750,6 +843,7 @@ async fn run(
             Ok(false) => healthy &= fail("scale 2", format!("stream is {:?}", c.seen.stream)),
             Err(e) => return fail("scale 2", e),
         }
+        healthy &= decode_follows(&mut c, decode.map(|d| d.0), "scale 2").await;
         // Motion goes in the logical space (1280x720 here); the cursor comes
         // back in stream pixels, so twice the numbers.
         let _ =
@@ -805,6 +899,12 @@ async fn run(
                 }
                 Err(e) => return fail("scale change", e),
             }
+            healthy &= decode_follows(
+                &mut c,
+                decode.map(|d| d.0),
+                &format!("scale change to {w}x{h} at {scale}"),
+            )
+            .await;
         }
     }
 

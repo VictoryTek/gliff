@@ -195,12 +195,36 @@ fn main() {
 
     let started = Instant::now();
     let main_loop = gtk4::glib::MainLoop::new(None, false);
+    // A private screen changes mode under the window (resizes, scales), and
+    // Mutter has been seen to move the window off it. With a CONNECTOR, put it
+    // back, and count how often that was needed.
+    let moved_back = Rc::new(Cell::new(0u32));
     {
         let main_loop = main_loop.clone();
+        let (window, moved_back, connector) =
+            (window.clone(), moved_back.clone(), connector.clone());
         gtk4::glib::timeout_add_local(Duration::from_millis(200), move || {
             if started.elapsed() >= Duration::from_secs(secs) {
                 main_loop.quit();
                 return gtk4::glib::ControlFlow::Break;
+            }
+            if let (Some(want), Some(display)) =
+                (connector.as_deref(), gtk4::gdk::Display::default())
+            {
+                let monitors = display.monitors();
+                let target = (0..monitors.n_items())
+                    .filter_map(|i| monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+                    .find(|m| m.connector().is_some_and(|c| c.starts_with(want)));
+                let on = window
+                    .surface()
+                    .and_then(|surface| display.monitor_at_surface(&surface))
+                    .and_then(|m| m.connector());
+                if let Some(target) = target {
+                    if on.as_deref() != target.connector().as_deref() {
+                        window.fullscreen_on_monitor(&target);
+                        moved_back.set(moved_back.get() + 1);
+                    }
+                }
             }
             gtk4::glib::ControlFlow::Continue
         });
@@ -213,6 +237,9 @@ fn main() {
         "drew {n} frames in {secs:.1} s ({:.1} per second)",
         f64::from(n) / secs
     );
+    if connector.is_some() {
+        println!("moved back onto the monitor {} time(s)", moved_back.get());
+    }
     let p = presented.borrow();
     println!(
         "painted {} times; the compositor presented {} ({:.1} per second), {} had no presentation time, {} incomplete when looked at; median gap {:.1} ms (refresh interval {:.1} ms)",
