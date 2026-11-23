@@ -67,6 +67,14 @@ struct Seen {
     pipeline: Option<gliff_proto::VideoPipeline>,
     /// When set, every video frame is logged: arrival time, id, bytes, key.
     frame_log: Option<Vec<(Instant, u64, usize, bool)>>,
+    /// With `--decode`: a decoder for the current stream, the mean colour
+    /// (r, g, b) of the middle of the last decoded picture with its size,
+    /// how many pictures were decoded, and what went wrong.
+    decode: bool,
+    decoder: Option<gliff_sw::Decoder>,
+    decoded: Option<((u32, u32), [f64; 3])>,
+    decoded_count: u64,
+    decode_errors: Vec<String>,
     cursor_shapes: u32,
     cursor: Option<(f64, f64, bool)>,
     /// Selections the server reported, by mime types.
@@ -113,10 +121,29 @@ impl Client {
                 keyframe,
                 ..
             } => {
-                self.rd
+                let payload = self
+                    .rd
                     .read_payload(data_len + aux_len)
                     .await
                     .map_err(|e| e.to_string())?;
+                if let Some(decoder) = self.seen.decoder.as_mut() {
+                    let (main, aux) = payload.split_at(*data_len as usize);
+                    match decoder.decode(main, aux) {
+                        Ok(Some(f)) => {
+                            self.seen.decoded_count += 1;
+                            self.seen.decoded = Some((
+                                (f.width, f.height),
+                                middle_colour(&f.pixels, f.width, f.height),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if self.seen.decode_errors.len() < 5 {
+                                self.seen.decode_errors.push(e.to_string());
+                            }
+                        }
+                    }
+                }
                 self.seen.frames += 1;
                 self.seen.last_frame_id = *frame_id;
                 if let Some(log) = self.seen.frame_log.as_mut() {
@@ -213,8 +240,25 @@ impl Client {
                 height,
                 pipeline,
                 scale_milli,
+                chroma,
                 ..
             } => {
+                if self.seen.decode {
+                    // As the viewer does: both stream kinds but the plain
+                    // 4:2:0 one have an auxiliary stream.
+                    self.seen.decoded = None;
+                    self.seen.decoder = match gliff_sw::Decoder::new(
+                        *chroma != ChromaMode::Single420,
+                        *width,
+                        *height,
+                    ) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            self.seen.decode_errors.push(format!("decoder: {e}"));
+                            None
+                        }
+                    };
+                }
                 self.seen.stream = Some((*width, *height));
                 self.seen.scale_milli = *scale_milli;
                 self.seen.configs += 1;
@@ -254,6 +298,36 @@ fn monitor_rates() -> Result<Vec<(String, f64)>, String> {
         .collect();
     rates.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(rates)
+}
+
+/// The mean (r, g, b) of the middle half of a BGRA picture, from a grid of
+/// samples.
+fn middle_colour(bgra: &[u8], width: u32, height: u32) -> [f64; 3] {
+    let (w, h) = (width as usize, height as usize);
+    let (x0, x1, y0, y1) = (w / 4, w * 3 / 4, h / 4, h * 3 / 4);
+    let (mut sum, mut n) = ([0.0f64; 3], 0.0f64);
+    for y in (y0..y1).step_by(8) {
+        for x in (x0..x1).step_by(8) {
+            let i = (y * w + x) * 4;
+            if let Some(px) = bgra.get(i..i + 3) {
+                sum[0] += f64::from(px[2]);
+                sum[1] += f64::from(px[1]);
+                sum[2] += f64::from(px[0]);
+                n += 1.0;
+            }
+        }
+    }
+    if n == 0.0 {
+        return [0.0; 3];
+    }
+    [sum[0] / n, sum[1] / n, sum[2] / n]
+}
+
+/// Whether `got` is `want` within `tolerance` on every channel.
+fn colour_matches(got: [f64; 3], want: [u8; 3], tolerance: f64) -> bool {
+    got.iter()
+        .zip(want)
+        .all(|(g, w)| (g - f64::from(w)).abs() <= tolerance)
 }
 
 fn monitor_names() -> Result<Vec<String>, String> {
@@ -315,6 +389,24 @@ async fn main() {
         eprintln!("--stall needs --load");
         std::process::exit(2);
     }
+    // --decode RRGGBB: decode the stream like the viewer and require the
+    // middle of the picture to be this colour (cover the mirrored or private
+    // screen with `gliff-gnome-animate SECS solid:RRGGBB [CONNECTOR]`).
+    let mut decode = None;
+    if let Some(i) = extra.iter().position(|a| a == "--decode") {
+        decode = extra
+            .get(i + 1)
+            .filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|h| {
+                let v = u32::from_str_radix(h, 16).ok()?;
+                Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+            });
+        if decode.is_none() {
+            eprintln!("--decode needs a colour as six hex digits, RRGGBB");
+            std::process::exit(2);
+        }
+        extra.drain(i..(i + 2).min(extra.len()));
+    }
     let healthy = run(
         &server,
         &extra,
@@ -323,11 +415,13 @@ async fn main() {
         rich,
         soak,
         load.map(|l| (l, stall)),
+        decode,
     )
     .await;
     std::process::exit(if healthy { 0 } else { 1 });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     server: &str,
     extra: &[String],
@@ -336,6 +430,7 @@ async fn run(
     rich: bool,
     soak_secs: Option<u64>,
     load: Option<(u64, Option<u64>)>,
+    decode: Option<[u8; 3]>,
 ) -> bool {
     let before = match monitor_names() {
         Ok(n) => n,
@@ -369,7 +464,10 @@ async fn run(
     let mut c = Client {
         rd: Framed::new(child.stdout.take().expect("stdout")),
         wr: Framed::new(child.stdin.take().expect("stdin")),
-        seen: Seen::default(),
+        seen: Seen {
+            decode: decode.is_some(),
+            ..Seen::default()
+        },
     };
     let mut healthy = true;
 
@@ -427,6 +525,39 @@ async fn run(
         ),
         Ok(false) => healthy &= fail("first frame", "none in 15 s"),
         Err(e) => return fail("first frame", e),
+    }
+
+    if let Some(want) = decode {
+        // The first pictures may be what was on the screen before the
+        // coloured window came up: wait for the colour.
+        let hit = |s: &Seen| {
+            s.decoded
+                .is_some_and(|(size, m)| s.stream == Some(size) && colour_matches(m, want, 16.0))
+        };
+        match c.until(Duration::from_secs(25), hit).await {
+            Ok(true) => {
+                let (size, m) = c.seen.decoded.unwrap_or_default();
+                ok(
+                    "decoded picture",
+                    format!(
+                        "{size:?}, middle rgb ({:.0}, {:.0}, {:.0}) for wanted {:02x}{:02x}{:02x}; {} pictures decoded, {} decode errors",
+                        m[0], m[1], m[2], want[0], want[1], want[2],
+                        c.seen.decoded_count, c.seen.decode_errors.len()
+                    ),
+                );
+            }
+            Ok(false) => {
+                healthy &= fail(
+                    "decoded picture",
+                    format!(
+                        "last {:?} for wanted {:02x}{:02x}{:02x} within 25 s; {} decoded, errors {:?}",
+                        c.seen.decoded, want[0], want[1], want[2],
+                        c.seen.decoded_count, c.seen.decode_errors
+                    ),
+                );
+            }
+            Err(e) => return fail("decoded picture", e),
+        }
     }
 
     if headless {

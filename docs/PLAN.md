@@ -471,6 +471,15 @@ The `--headless` regression of the frame-rate fix (see "A changing screen and a 
 - It checks the refresh rate only, not that frames have pixels (the client does not see Mutter's empty buffers, which the capture probe counts) and not other changes to what Mutter does with a stream's format; those would show up as a frame rate in `serve_probe --headless --load` with the animation on the private screen, which is a measurement, not a pass or fail on rate (it fails below 20 frames a second or on a gap of a second).
 - The question left open in "A changing screen and a client that stops reading" about the "Pasting text" notifications is answered by reading the code (see "Test caveat found on the way" in "The shortcut prompt on GNOME").
 
+### Does the picture decode to the screen? (2026-11-22)
+
+No GNOME probe had decoded the video: `serve_probe` read frames and threw the bytes away, and the one decoding check (`gliff-gnome-dmabuf-probe`) compares the capture side only. So nothing showed on a real GPU that the stream the server sends, GPU or CPU pipeline, mirror or private screen, decodes to what is on the screen.
+
+- **Added:** `serve_probe --decode RRGGBB` decodes every video frame with `gliff_sw::Decoder` (the viewer's CPU decoder, `dual` as the viewer chooses it, from the stream's `chroma`), and requires the middle half of a decoded picture (sampled on an 8-pixel grid) to be that colour within 16 on each channel, within 25 s, at the stream's size. `gliff-gnome-animate SECS solid:RRGGBB [CONNECTOR]` paints one colour and nothing else.
+- **Run on the NVIDIA desktop** (GNOME 50.6), screen `c83c6e` = (200, 60, 110): mirror of `HDMI-1`, GPU pipeline (4:4:4 as two streams): decoded middle (199, 60, 110), 1920x1080; mirror, CPU pipeline (`GLIFF_VIDEO=cpu`): (197, 61, 110); private screen (`--headless`, window on `Meta-`), GPU pipeline: (199, 60, 110), the new monitor at 60.000 Hz. No decode errors. **Control:** told `6e3cc8` (red and blue swapped) for the same screen, the probe fails after 25 s with exit status 1 and prints the colour it did decode, (199, 60, 110).
+- **What this shows:** the right size, the right colours and the right channel order, for both pipelines, after the CPU decoder. **What it does not:** a GPU decoder (VA-API on the viewer; the viewer here is the CPU one), motion and sharpness (a flat colour hides blur, blocking and the chroma subsampling that fine text would show), timing, or a changing screen. A matrix mismatch between encoder and decoder would show on a saturated colour like this one only if it moved a channel by more than 16; the tolerance is a guess, not derived.
+- The check passes on the first decoded picture that matches, so a stream that is right for one picture and wrong later is not caught.
+
 ### Upstream sync: how much the fork costs to keep (2026-11-21)
 
 Asked: do the changes so far still let us merge upstream as it changes? Answer: yes, but not for free. Everything GNOME is in new crates and files that upstream cannot conflict with; the cost is the seam in `crates/gliff-server/src/session.rs`.

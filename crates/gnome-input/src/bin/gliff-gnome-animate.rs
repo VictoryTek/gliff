@@ -2,12 +2,15 @@
 //! session under load: every capture frame of the monitor it covers differs
 //! from the one before, as in video, a game or fast scrolling.
 //!
-//!   gliff-gnome-animate [SECS [RECTS [CONNECTOR]]]
+//!   gliff-gnome-animate [SECS [RECTS|solid:RRGGBB [CONNECTOR]]]
 //!                                 run for SECS seconds (default 60), drawing
 //!                                 RECTS coloured rectangles a frame (default
 //!                                 300), then print how many frames it drew
 //!                                 and how many of them the compositor
-//!                                 reported as presented
+//!                                 reported as presented.
+//!                                 With solid:RRGGBB it paints that one colour
+//!                                 and nothing else (the picture a decoding
+//!                                 test can recognise).
 //!                                 With CONNECTOR (a name or its start, such
 //!                                 as Meta- for a private screen) it waits up
 //!                                 to 30 s for that monitor and covers it,
@@ -88,10 +91,27 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let rects: u32 = std::env::args()
-        .nth(2)
+    let second = std::env::args().nth(2);
+    let rects: u32 = second
+        .as_deref()
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
+    let solid: Option<(f64, f64, f64)> = second
+        .as_deref()
+        .and_then(|s| s.strip_prefix("solid:"))
+        .filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .map(|v| {
+            (
+                f64::from((v >> 16) & 0xff) / 255.0,
+                f64::from((v >> 8) & 0xff) / 255.0,
+                f64::from(v & 0xff) / 255.0,
+            )
+        });
+    if second.as_deref().is_some_and(|s| s.starts_with("solid:")) && solid.is_none() {
+        println!("[FAIL] argument: solid: needs six hex digits, RRGGBB");
+        std::process::exit(2);
+    }
     let connector = std::env::args().nth(3);
     if gtk4::init().is_err() {
         println!("[FAIL] gtk: cannot open a display");
@@ -126,6 +146,11 @@ fn main() {
         let (frame, paints) = (frame.clone(), paints.clone());
         area.set_draw_func(move |_, cr, w, h| {
             paints.set(paints.get() + 1);
+            if let Some((r, g, b)) = solid {
+                cr.set_source_rgb(r, g, b);
+                let _ = cr.paint();
+                return;
+            }
             let n = frame.get();
             let (w, h) = (f64::from(w), f64::from(h));
             cr.set_source_rgb(0.08, 0.08, 0.1);
@@ -153,7 +178,9 @@ fn main() {
         move |area, clock| {
             frame.set(frame.get().wrapping_add(1));
             presented.borrow_mut().update(clock);
-            area.queue_draw();
+            if solid.is_none() {
+                area.queue_draw();
+            }
             gtk4::glib::ControlFlow::Continue
         }
     });

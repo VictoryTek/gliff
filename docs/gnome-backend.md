@@ -205,7 +205,13 @@ frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor (and, for
 a private screen, that its refresh rate is usable: at least 30 Hz), the
 pointer, the cursor shape, resizes and that the monitors are back to normal
 afterwards, and with `--headless` the scale (2, 1.5, a 4K window and a
-change at the same size). It does not decode video. With `--rich-clipboard` it
+change at the same size). It does not decode video unless asked: with
+`--decode RRGGBB` it decodes the stream with the viewer's own CPU decoder
+(`gliff-sw`, for either server pipeline) and requires the middle of the
+picture to be that colour, within 16 on each channel, within 25 s (cover the
+screen with `gliff-gnome-animate 60 solid:RRGGBB CONNECTOR`, `CONNECTOR` being
+the mirrored monitor or `Meta-` for a private screen). It checks the colour
+and the picture size, not motion, sharpness or timing. With `--rich-clipboard` it
 also moves an image, two files (one of 3 MB) and a folder through the server's
 clipboard in both directions, with a plain Mutter client playing the desktop's
 applications (it replaces the desktop's clipboard while it runs):
