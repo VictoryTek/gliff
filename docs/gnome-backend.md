@@ -54,16 +54,23 @@ The probe reports the frame size, whether the pixels are real, the frame rate,
 whether a recapture works and what the cursor did; `--png` saves the first
 frame so it can be looked at.
 
-The format we offer names a maximum frame rate of 0, which Mutter reads as no
-limit. Without it Mutter skips any frame that comes less than 1/maximum after
-the last one, and for a monitor its own maximum is the monitor's refresh rate,
-which on a 60 Hz monitor cost about a third of the frames (38 to 40 of 59 a
-second, seen on the NVIDIA desktop; see "A changing screen and a client that
-stops reading, on GNOME" in `docs/PLAN.md`). A monitor now streams at the
-display's rate (59.4 a second measured on a 60 Hz monitor). This needs a
-Mutter whose monitor offer allows 0 (50.6 does; 46 starts at 1, so there a
-fixed 0 would leave nothing in common and capture would not start); only 50.6
-has been tested.
+For the stream of an existing monitor the format we offer names a maximum frame
+rate of 0, which Mutter reads as no limit (`Options::unlimited_rate`, set by
+the mirror mode). Without it Mutter skips any frame that comes less than
+1/maximum after the last one, and for a monitor its own maximum is the
+monitor's refresh rate, which on a 60 Hz monitor cost about a third of the
+frames (38 to 40 of 59 a second, seen on the NVIDIA desktop; see "A changing
+screen and a client that stops reading, on GNOME" in `docs/PLAN.md`). A
+monitor now streams at the display's rate (59.4 a second measured on a 60 Hz
+monitor). This needs a Mutter whose monitor offer allows 0 (50.6 does; 46
+starts at 1, so there a fixed 0 would leave nothing in common and capture
+would not start); only 50.6 has been tested.
+
+A virtual monitor (`--headless`) is offered no maximum at all: Mutter gives the
+new monitor the refresh rate it finds there, so naming 0 makes a 0 Hz monitor
+(seen: a `1920x1080@0.000` mode and buffers with no pixels). A private screen
+was never limited: 59.2 frames a second with no limit named, 56 through the
+server on the GPU pipeline once its rate ladder stepped up.
 
 The dmabuf path needs a GPU, so it has its own probe in `gnome-backend`:
 
@@ -218,6 +225,15 @@ again (it does not check that the first ones are fresh):
 ```
 gliff-gnome-animate 90 &                  # a fullscreen window that changes every frame
 serve_probe target/debug/gliff-server --load 30 --stall 20
+```
+
+On a private screen the animation has to be told which monitor to cover, and
+it waits (up to 30 s) for it to appear; the probe then skips the resize and
+scale steps:
+
+```
+gliff-gnome-animate 90 30 Meta- &         # covers the private screen once it exists
+serve_probe target/debug/gliff-server --headless --load 40
 ```
 
 `--headless --soak SECS` keeps the session up for SECS seconds, resizing it

@@ -49,6 +49,13 @@ pub struct Options {
     /// these; without, or when Mutter picks none, frames come in shared
     /// memory. [`Capturer::use_shm`] drops the offer.
     pub dmabuf: Vec<(drm_fourcc::DrmFourcc, Vec<u64>)>,
+    /// Ask for no frame-rate limit. For the stream of an existing monitor
+    /// only: Mutter otherwise skips frames that come sooner than the
+    /// monitor's refresh interval after the last, which cost a third of the
+    /// frames of a 60 Hz monitor. Leave it off for a virtual monitor, whose
+    /// refresh rate Mutter takes from this very value (zero gives a 0 Hz
+    /// monitor). Needs a Mutter whose monitor offer allows 0 (50.6 does).
+    pub unlimited_rate: bool,
 }
 
 impl Options {
@@ -62,6 +69,7 @@ impl Options {
             size: None,
             scale: None,
             dmabuf: Vec::new(),
+            unlimited_rate: false,
         }
     }
 }

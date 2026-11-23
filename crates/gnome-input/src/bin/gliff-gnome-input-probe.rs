@@ -137,8 +137,11 @@ fn run(actions: &[String]) -> bool {
         Err(e) => return fail("stream", format!("{e:#}")),
     };
     let (tx, cursor_rx) = mpsc::channel();
+    let mut options = Options::new(node, &session.runtime_dir, "input-probe");
+    // A real monitor's stream, offered as the server offers it.
+    options.unlimited_rate = true;
     let _capture = match Capturer::start(
-        Options::new(node, &session.runtime_dir, "input-probe"),
+        options,
         Box::new(move |ev| {
             if let CaptureEvent::CursorPos { x, y, .. } = ev {
                 let _ = tx.send((x, y));

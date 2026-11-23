@@ -20,7 +20,9 @@
 //! short run cannot.
 //!
 //! With `--load SECS` (a mirrored screen, with `gliff-gnome-animate` running
-//! on it) the client then judges the stream while the picture changes all the
+//! on it; or with `--headless`, then without the resize and scale steps and
+//! with `gliff-gnome-animate SECS RECTS Meta-` to cover the private screen)
+//! the client then judges the stream while the picture changes all the
 //! time: frames per second, the longest gap, bytes per frame, the server's CPU
 //! and memory. `--stall SECS` adds a stretch where the client stops reading, as
 //! a slow link would, and checks that the server's memory stays bounded and
@@ -304,8 +306,8 @@ async fn main() {
             extra.drain(i..(i + 2).min(extra.len()));
         }
     }
-    if (load.is_some() && headless) || (stall.is_some() && load.is_none()) {
-        eprintln!("--load works on a mirrored screen (no --headless); --stall needs --load");
+    if stall.is_some() && load.is_none() {
+        eprintln!("--stall needs --load");
         std::process::exit(2);
     }
     let healthy = run(
@@ -455,7 +457,8 @@ async fn run(
         healthy &= fail("cursor shape", "none received");
     }
 
-    if headless {
+    // The resize and scale steps change the screen under a --load run.
+    if headless && load.is_none() {
         for (w, h) in [(1280u32, 720u32), (1600, 900)] {
             let resize = ClientMsg::Resize {
                 width: w,
@@ -479,7 +482,7 @@ async fn run(
         }
     }
 
-    if headless {
+    if headless && load.is_none() {
         // A HiDPI viewer: 2560x1440 pixels at scale 2 is a 1280x720 desktop.
         let (w, h) = (2560u32, 1440u32);
         let resize = ClientMsg::Resize {

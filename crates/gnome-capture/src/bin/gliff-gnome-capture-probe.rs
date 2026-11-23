@@ -129,8 +129,12 @@ fn run(args: &Args) -> bool {
     );
 
     let (tx, rx) = mpsc::channel();
+    let mut options = Options::new(node, &session.runtime_dir, "probe");
+    // The same offer the server makes: no limit for a monitor, none named
+    // for a virtual monitor (its refresh rate comes from it).
+    options.unlimited_rate = !args.virtual_source;
     let cap = match Capturer::start(
-        Options::new(node, &session.runtime_dir, "probe"),
+        options,
         Box::new(move |ev| {
             let _ = tx.send((Instant::now(), ev));
         }),

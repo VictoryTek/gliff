@@ -113,7 +113,12 @@ enum Mods<'a> {
 /// One format alternative. With `fixed`, the size is that one size, which asks
 /// a virtual monitor to take it; without, any size, which lets the producer
 /// choose.
-fn format_pod(fixed: Option<(u32, u32)>, formats: &[VideoFormat], mods: Mods) -> Vec<u8> {
+fn format_pod(
+    fixed: Option<(u32, u32)>,
+    unlimited: bool,
+    formats: &[VideoFormat],
+    mods: Mods,
+) -> Vec<u8> {
     use spa::param::format::{FormatProperties as F, MediaSubtype, MediaType};
     use spa::pod::ChoiceValue;
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
@@ -200,10 +205,17 @@ fn format_pod(fixed: Option<(u32, u32)>, formats: &[VideoFormat], mods: Mods) ->
     // Needs a Mutter whose monitor offer starts at 0 (50.6 does; 46 starts at
     // 1, where a fixed 0 would leave nothing in common and capture would
     // not start). This backend is only tested on 50.6.
-    properties.push(Property::new(
-        F::VideoMaxFramerate.as_raw(),
-        Value::Fraction(Fraction { num: 0, denom: 1 }),
-    ));
+    //
+    // Only for a stream of an existing monitor. For a virtual monitor the
+    // maximum is the refresh rate Mutter gives the new monitor
+    // (`create_mode_info` in its virtual stream source): 0 made a 0 Hz
+    // monitor, with empty buffers all the time.
+    if unlimited {
+        properties.push(Property::new(
+            F::VideoMaxFramerate.as_raw(),
+            Value::Fraction(Fraction { num: 0, denom: 1 }),
+        ));
+    }
     serialize(Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -212,22 +224,26 @@ fn format_pod(fixed: Option<(u32, u32)>, formats: &[VideoFormat], mods: Mods) ->
 }
 
 /// The shared-memory form of every layout we accept.
-fn enum_format(fixed: Option<(u32, u32)>) -> Vec<u8> {
-    format_pod(fixed, &SHM_FORMATS, Mods::None)
+fn enum_format(fixed: Option<(u32, u32)>, unlimited: bool) -> Vec<u8> {
+    format_pod(fixed, unlimited, &SHM_FORMATS, Mods::None)
 }
 
 /// Everything we accept, best first: each layout as a dmabuf with the
 /// modifiers the consumer can import, then shared memory.
-fn enum_formats(fixed: Option<(u32, u32)>, dmabuf: &[(DrmFourcc, Vec<u64>)]) -> Vec<Vec<u8>> {
+fn enum_formats(
+    fixed: Option<(u32, u32)>,
+    unlimited: bool,
+    dmabuf: &[(DrmFourcc, Vec<u64>)],
+) -> Vec<Vec<u8>> {
     let mut pods: Vec<Vec<u8>> = dmabuf
         .iter()
         .filter(|(_, mods)| !mods.is_empty())
         .filter_map(|(fourcc, mods)| {
             let format = video_format(*fourcc)?;
-            Some(format_pod(fixed, &[format], Mods::Offer(mods)))
+            Some(format_pod(fixed, unlimited, &[format], Mods::Offer(mods)))
         })
         .collect();
-    pods.push(enum_format(fixed));
+    pods.push(enum_format(fixed, unlimited));
     pods
 }
 
@@ -239,6 +255,7 @@ fn fixate(
     format: VideoFormat,
     size: (u32, u32),
     offered: &[u64],
+    unlimited: bool,
 ) -> Result<Vec<u8>, String> {
     use spa::param::format::FormatProperties as F;
     use spa::pod::deserialize::PodDeserializer;
@@ -277,7 +294,12 @@ fn fixate(
         .ok_or_else(|| {
             format!("Mutter offers no modifier we can import (it offered {candidates:x?})")
         })?;
-    Ok(format_pod(Some(size), &[format], Mods::Fixed(chosen)))
+    Ok(format_pod(
+        Some(size),
+        unlimited,
+        &[format],
+        Mods::Fixed(chosen),
+    ))
 }
 
 /// Buffers in shared memory: the CPU path reads them.
@@ -890,7 +912,10 @@ fn run_inner(
                 // The scale goes first: Mutter reads it when the format
                 // arrives.
                 let tag = scale_tag(scale);
-                let formats = enum_formats(Some((width, height)), &st.borrow().options.dmabuf);
+                let formats = {
+                    let o = &st.borrow().options;
+                    enum_formats(Some((width, height)), o.unlimited_rate, &o.dmabuf)
+                };
                 let mut params = vec![Pod::from_bytes(&tag).expect("tag pod")];
                 params.extend(
                     formats
@@ -919,7 +944,7 @@ fn run_inner(
                     }
                     (s.size != (0, 0)).then_some(s.size)
                 };
-                let format = enum_format(size);
+                let format = enum_format(size, st.borrow().options.unlimited_rate);
                 let mut params = [Pod::from_bytes(&format).expect("format pod")];
                 if let Err(e) = stream.update_params(&mut params) {
                     st.borrow_mut().fail(format!("use shared memory: {e}"));
@@ -961,7 +986,14 @@ fn run_inner(
                     .flat_map(|(_, m)| m.iter().copied())
                     .collect();
                 st.borrow().stats.fixations.fetch_add(1, Ordering::Relaxed);
-                match fixate(param, fmt.format(), (size.width, size.height), &offered) {
+                let unlimited = st.borrow().options.unlimited_rate;
+                match fixate(
+                    param,
+                    fmt.format(),
+                    (size.width, size.height),
+                    &offered,
+                    unlimited,
+                ) {
                     Ok(pod) => {
                         let mut params = [Pod::from_bytes(&pod).expect("format pod")];
                         if let Err(e) = stream.update_params(&mut params) {
@@ -1032,7 +1064,10 @@ fn run_inner(
         .register()
         .map_err(|e| err("stream listener")(&e))?;
 
-    let formats = enum_formats(node_size, &state.borrow().options.dmabuf);
+    let formats = {
+        let o = &state.borrow().options;
+        enum_formats(node_size, o.unlimited_rate, &o.dmabuf)
+    };
     let tag = node_scale.map(scale_tag);
     let mut params: Vec<&Pod> = formats
         .iter()
@@ -1099,8 +1134,13 @@ mod tests {
 
     #[test]
     fn offered_modifiers_are_mandatory_and_left_to_the_producer() {
-        let p = modifier_property(&format_pod(None, &[VideoFormat::BGRx], Mods::Offer(&TILED)))
-            .expect("a modifier property");
+        let p = modifier_property(&format_pod(
+            None,
+            false,
+            &[VideoFormat::BGRx],
+            Mods::Offer(&TILED),
+        ))
+        .expect("a modifier property");
         assert!(p.flags.contains(PropertyFlags::MANDATORY));
         assert!(p.flags.contains(PropertyFlags::from_bits_retain(
             spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE
@@ -1124,7 +1164,7 @@ mod tests {
 
     #[test]
     fn the_shared_memory_form_has_no_modifier() {
-        assert!(modifier_property(&enum_format(None)).is_none());
+        assert!(modifier_property(&enum_format(None, false)).is_none());
     }
 
     #[test]
@@ -1133,11 +1173,11 @@ mod tests {
             (DrmFourcc::Xrgb8888, TILED.to_vec()),
             (DrmFourcc::Argb8888, Vec::new()),
         ];
-        let pods = enum_formats(None, &offer);
+        let pods = enum_formats(None, false, &offer);
         assert_eq!(pods.len(), 2, "one dmabuf alternative, then shared memory");
         assert!(modifier_property(&pods[0]).is_some());
         assert!(modifier_property(&pods[1]).is_none());
-        assert_eq!(enum_formats(None, &[]).len(), 1);
+        assert_eq!(enum_formats(None, false, &[]).len(), 1);
     }
 
     #[test]
@@ -1146,38 +1186,59 @@ mod tests {
         let theirs = [TILED[2], 0x1234, TILED[1]];
         let producer = format_pod(
             Some((1920, 1080)),
+            false,
             &[VideoFormat::BGRx],
             Mods::Offer(&theirs),
         );
         let param = Pod::from_bytes(&producer).unwrap();
         let ours = [TILED[1], TILED[0]];
-        let fixed = fixate(param, VideoFormat::BGRx, (1920, 1080), &ours).expect("a choice");
+        let fixed = fixate(param, VideoFormat::BGRx, (1920, 1080), &ours, false).expect("a choice");
         let p = modifier_property(&fixed).unwrap();
         assert!(matches!(p.value, Value::Long(m) if m as u64 == TILED[1]));
         assert!(!p.flags.contains(PropertyFlags::from_bits_retain(
             spa_sys::SPA_POD_PROP_FLAG_DONT_FIXATE
         )));
         // Nothing in common is an error that says what Mutter offered.
-        let err = fixate(param, VideoFormat::BGRx, (1920, 1080), &[1, 2]).unwrap_err();
+        let err = fixate(param, VideoFormat::BGRx, (1920, 1080), &[1, 2], false).unwrap_err();
         assert!(err.contains("offers no modifier we can import"), "{err}");
     }
 
+    fn max_framerate(bytes: &[u8]) -> Option<Value> {
+        object(bytes)
+            .properties
+            .into_iter()
+            .find(|p| p.key == spa::param::format::FormatProperties::VideoMaxFramerate.as_raw())
+            .map(|p| p.value)
+    }
+
     #[test]
-    fn every_form_asks_for_no_frame_rate_limit() {
+    fn a_monitor_stream_asks_for_no_frame_rate_limit_in_every_form() {
         // Mutter limits a monitor stream to the maximum it settles on, which
         // is its own offer (the refresh rate) unless we name one; zero is
-        // the only value it does not limit by. Shared memory and dmabuf alike.
+        // the only value it does not limit by. Shared memory, dmabuf, the
+        // fixed size and the fixated answer alike.
         let offer = [(DrmFourcc::Xrgb8888, TILED.to_vec())];
-        let mut forms = enum_formats(None, &offer);
-        forms.push(enum_format(Some((1280, 720))));
-        assert_eq!(forms.len(), 3);
+        let mut forms = enum_formats(None, true, &offer);
+        forms.push(enum_format(Some((1280, 720)), true));
+        let producer = format_pod(
+            Some((1920, 1080)),
+            true,
+            &[VideoFormat::BGRx],
+            Mods::Offer(&TILED),
+        );
+        forms.push(
+            fixate(
+                Pod::from_bytes(&producer).unwrap(),
+                VideoFormat::BGRx,
+                (1920, 1080),
+                &TILED,
+                true,
+            )
+            .unwrap(),
+        );
+        assert_eq!(forms.len(), 4);
         for form in forms {
-            let max = object(&form)
-                .properties
-                .into_iter()
-                .find(|p| p.key == spa::param::format::FormatProperties::VideoMaxFramerate.as_raw())
-                .expect("a max frame rate")
-                .value;
+            let max = max_framerate(&form).expect("a max frame rate");
             assert!(
                 matches!(max, Value::Fraction(Fraction { num: 0, denom: 1 })),
                 "{max:?}"
@@ -1186,14 +1247,45 @@ mod tests {
     }
 
     #[test]
+    fn a_virtual_monitor_stream_names_no_maximum() {
+        // For a virtual monitor the maximum becomes the new monitor's
+        // refresh rate: naming 0 made a 0 Hz monitor.
+        let offer = [(DrmFourcc::Xrgb8888, TILED.to_vec())];
+        let mut forms = enum_formats(None, false, &offer);
+        forms.push(enum_format(Some((1280, 720)), false));
+        let producer = format_pod(
+            Some((1920, 1080)),
+            false,
+            &[VideoFormat::BGRx],
+            Mods::Offer(&TILED),
+        );
+        forms.push(
+            fixate(
+                Pod::from_bytes(&producer).unwrap(),
+                VideoFormat::BGRx,
+                (1920, 1080),
+                &TILED,
+                false,
+            )
+            .unwrap(),
+        );
+        for form in forms {
+            assert!(max_framerate(&form).is_none());
+        }
+    }
+
+    #[test]
     fn a_fixed_format_names_one_size_and_the_default_takes_any() {
         assert!(matches!(
-            video_size(&enum_format(Some((1280, 720)))),
+            video_size(&enum_format(Some((1280, 720)), false)),
             Value::Rectangle(Rectangle {
                 width: 1280,
                 height: 720
             })
         ));
-        assert!(matches!(video_size(&enum_format(None)), Value::Choice(_)));
+        assert!(matches!(
+            video_size(&enum_format(None, false)),
+            Value::Choice(_)
+        ));
     }
 }

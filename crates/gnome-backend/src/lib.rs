@@ -387,6 +387,7 @@ impl Backend for GnomeBackend {
         options.buffers = config.buffers;
         options.max_size = config.max_size;
         options.dmabuf = offer;
+        options.unlimited_rate = true;
         let capturer = Capturer::start(options, sink)?;
         let mirror = Arc::new(Mirror {
             connector: monitor.connector.clone(),

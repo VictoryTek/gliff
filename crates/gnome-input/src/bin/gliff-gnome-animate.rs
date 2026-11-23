@@ -2,12 +2,16 @@
 //! session under load: every capture frame of the monitor it covers differs
 //! from the one before, as in video, a game or fast scrolling.
 //!
-//!   gliff-gnome-animate [SECS [RECTS]]
+//!   gliff-gnome-animate [SECS [RECTS [CONNECTOR]]]
 //!                                 run for SECS seconds (default 60), drawing
 //!                                 RECTS coloured rectangles a frame (default
 //!                                 300), then print how many frames it drew
 //!                                 and how many of them the compositor
 //!                                 reported as presented
+//!                                 With CONNECTOR (a name or its start, such
+//!                                 as Meta- for a private screen) it waits up
+//!                                 to 30 s for that monitor and covers it,
+//!                                 not the primary one
 //!
 //! It draws the rectangles and a sweeping bar per frame, so the picture is
 //! busy enough to need real bit rate from the encoder. More rectangles cost
@@ -88,8 +92,30 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
+    let connector = std::env::args().nth(3);
     if gtk4::init().is_err() {
         println!("[FAIL] gtk: cannot open a display");
+        std::process::exit(1);
+    }
+    // A monitor that does not exist yet (a private screen appears once a
+    // session starts): wait for it, letting GDK see the change.
+    let target = connector.as_deref().and_then(|want| {
+        let display = gtk4::gdk::Display::default()?;
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let monitors = display.monitors();
+            let found = (0..monitors.n_items())
+                .filter_map(|i| monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+                .find(|m| m.connector().is_some_and(|c| c.starts_with(want)));
+            if found.is_some() || Instant::now() >= until {
+                return found;
+            }
+            while gtk4::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    if let (Some(name), None) = (&connector, &target) {
+        println!("[FAIL] monitor: none named {name:?} appeared");
         std::process::exit(1);
     }
     let frame = Rc::new(Cell::new(0u32));
@@ -134,7 +160,10 @@ fn main() {
     let window = gtk4::Window::new();
     window.set_title(Some("gliff animate"));
     window.set_child(Some(&area));
-    window.fullscreen();
+    match &target {
+        Some(monitor) => window.fullscreen_on_monitor(monitor),
+        None => window.fullscreen(),
+    }
     window.present();
 
     let started = Instant::now();

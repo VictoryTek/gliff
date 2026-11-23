@@ -140,6 +140,8 @@ fn capture(
     let mut options = Options::new(source.node, &source.runtime_dir, "probe");
     options.dmabuf = dmabuf;
     options.size = size;
+    // A size means a virtual monitor, which must not be offered a limit of 0.
+    options.unlimited_rate = size.is_none();
     let cap = Capturer::start(
         options,
         Box::new(move |ev| {
