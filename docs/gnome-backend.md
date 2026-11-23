@@ -201,7 +201,8 @@ gliff-gnome-clipboard-probe rawwatch 14               # an ordinary application 
 ```
 
 `serve_probe` is a headless gliff client: it checks the greeting, the first
-frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor, the
+frame (and which pipeline made it: `Gpu` or `Cpu`), the new monitor (and, for
+a private screen, that its refresh rate is usable: at least 30 Hz), the
 pointer, the cursor shape, resizes and that the monitors are back to normal
 afterwards, and with `--headless` the scale (2, 1.5, a 4K window and a
 change at the same size). It does not decode video. With `--rich-clipboard` it

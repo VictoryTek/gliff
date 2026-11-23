@@ -243,16 +243,21 @@ impl Client {
     }
 }
 
-fn monitor_names() -> Result<Vec<String>, String> {
+/// Every monitor's connector and refresh rate, sorted by connector.
+fn monitor_rates() -> Result<Vec<(String, f64)>, String> {
     let desktop = gnome_ipc::find_session().map_err(|e| format!("{e:#}"))?;
     let conn = gnome_ipc::connect(&desktop.bus_address).map_err(|e| format!("{e:#}"))?;
-    let mut names: Vec<String> = gnome_ipc::monitors(&conn)
+    let mut rates: Vec<(String, f64)> = gnome_ipc::monitors(&conn)
         .map_err(|e| format!("{e:#}"))?
         .into_iter()
-        .map(|m| m.connector)
+        .map(|m| (m.connector, m.refresh_hz))
         .collect();
-    names.sort();
-    Ok(names)
+    rates.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(rates)
+}
+
+fn monitor_names() -> Result<Vec<String>, String> {
+    Ok(monitor_rates()?.into_iter().map(|(n, _)| n).collect())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -425,12 +430,33 @@ async fn run(
     }
 
     if headless {
-        match monitor_names() {
+        // One snapshot: the new monitor and its rate come from the same read.
+        match monitor_rates() {
             Ok(now) if now.len() == before.len() + 1 => {
-                let new: Vec<_> = now.iter().filter(|n| !before.contains(n)).collect();
-                ok("new monitor", format!("{new:?} while the session runs"));
+                let new: Vec<_> = now.iter().filter(|(n, _)| !before.contains(n)).collect();
+                let names: Vec<_> = new.iter().map(|(n, _)| n).collect();
+                ok("new monitor", format!("{names:?} while the session runs"));
+                // Mutter takes a virtual monitor's refresh rate from the frame
+                // rate negotiated for its stream: asking for a limit of 0 once
+                // made a 0 Hz screen that still produced sized frames.
+                if new.is_empty() {
+                    healthy &= fail("new monitor rate", "no monitor is new");
+                }
+                for (name, hz) in new {
+                    if *hz >= 30.0 {
+                        ok("new monitor rate", format!("{name} at {hz:.3} Hz"));
+                    } else {
+                        healthy &= fail(
+                            "new monitor rate",
+                            format!("{name} is at {hz:.3} Hz, not a usable refresh rate"),
+                        );
+                    }
+                }
             }
-            Ok(now) => healthy &= fail("new monitor", format!("{before:?} -> {now:?}")),
+            Ok(now) => {
+                let now: Vec<_> = now.into_iter().map(|(n, _)| n).collect();
+                healthy &= fail("new monitor", format!("{before:?} -> {now:?}"))
+            }
             Err(e) => healthy &= fail("new monitor", e),
         }
     }
