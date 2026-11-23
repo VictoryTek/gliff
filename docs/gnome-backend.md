@@ -62,9 +62,13 @@ monitor's refresh rate, which on a 60 Hz monitor cost about a third of the
 frames (38 to 40 of 59 a second, seen on the NVIDIA desktop; see "A changing
 screen and a client that stops reading, on GNOME" in `docs/PLAN.md`). A
 monitor now streams at the display's rate (59.4 a second measured on a 60 Hz
-monitor). This needs a Mutter whose monitor offer allows 0 (50.6 does; 46
-starts at 1, so there a fixed 0 would leave nothing in common and capture
-would not start); only 50.6 has been tested.
+monitor, shared memory and dmabuf alike). Every such format is followed by
+the same format without the request, so a Mutter whose monitor offer cannot
+meet it (46's starts at 1, where a fixed 0 leaves nothing in common) takes the
+plain one and streams as before, at about two thirds of the display's rate. A
+format Mutter hands back to fix the modifier keeps the request only if what it
+handed back allows 0. Only 50.6 has run; 46 was emulated there (see "Mutter 46
+and the frame rate" in `docs/PLAN.md`).
 
 A virtual monitor (`--headless`) is offered no maximum at all: Mutter gives the
 new monitor the refresh rate it finds there, so naming 0 makes a 0 Hz monitor

@@ -110,6 +110,9 @@ enum Mods<'a> {
     Fixed(u64),
 }
 
+/// The maximum frame rate that Mutter does not limit by.
+const NO_LIMIT: u32 = 0;
+
 /// One format alternative. With `fixed`, the size is that one size, which asks
 /// a virtual monitor to take it; without, any size, which lets the producer
 /// choose.
@@ -203,8 +206,9 @@ fn format_pod(
     // nothing. On a 60 Hz monitor, timestamp jitter then drops about a third
     // of the frames (seen: 38 to 40 of 59 a second). Zero means no limit.
     // Needs a Mutter whose monitor offer starts at 0 (50.6 does; 46 starts at
-    // 1, where a fixed 0 would leave nothing in common and capture would
-    // not start). This backend is only tested on 50.6.
+    // 1, where a fixed 0 leaves nothing in common): every such form is
+    // followed by the same form without it (`with_fallback`). Only 50.6 has
+    // run; the fallback was run there by offering a maximum it cannot meet.
     //
     // Only for a stream of an existing monitor. For a virtual monitor the
     // maximum is the refresh rate Mutter gives the new monitor
@@ -213,7 +217,10 @@ fn format_pod(
     if unlimited {
         properties.push(Property::new(
             F::VideoMaxFramerate.as_raw(),
-            Value::Fraction(Fraction { num: 0, denom: 1 }),
+            Value::Fraction(Fraction {
+                num: NO_LIMIT,
+                denom: 1,
+            }),
         ));
     }
     serialize(Object {
@@ -228,6 +235,23 @@ fn enum_format(fixed: Option<(u32, u32)>, unlimited: bool) -> Vec<u8> {
     format_pod(fixed, unlimited, &SHM_FORMATS, Mods::None)
 }
 
+/// A form, and when it asks for no frame rate limit the same form without
+/// that request right after it: a Mutter that cannot meet the request (46's
+/// monitor offer starts at 1) then takes the plain one, as it did before the
+/// request existed, and a Mutter that can takes the first.
+fn with_fallback(unlimited: bool, make: impl Fn(bool) -> Vec<u8>) -> Vec<Vec<u8>> {
+    if unlimited {
+        vec![make(true), make(false)]
+    } else {
+        vec![make(false)]
+    }
+}
+
+/// The shared-memory form, with its fallback.
+fn enum_format_list(fixed: Option<(u32, u32)>, unlimited: bool) -> Vec<Vec<u8>> {
+    with_fallback(unlimited, |u| enum_format(fixed, u))
+}
+
 /// Everything we accept, best first: each layout as a dmabuf with the
 /// modifiers the consumer can import, then shared memory.
 fn enum_formats(
@@ -240,11 +264,37 @@ fn enum_formats(
         .filter(|(_, mods)| !mods.is_empty())
         .filter_map(|(fourcc, mods)| {
             let format = video_format(*fourcc)?;
-            Some(format_pod(fixed, unlimited, &[format], Mods::Offer(mods)))
+            Some(with_fallback(unlimited, |u| {
+                format_pod(fixed, u, &[format], Mods::Offer(mods))
+            }))
         })
+        .flatten()
         .collect();
-    pods.push(enum_format(fixed, unlimited));
+    pods.extend(enum_format_list(fixed, unlimited));
     pods
+}
+
+/// Whether the producer's maximum frame rate allows the no-limit request.
+/// Mutter hands back what is left of the two offers, as a one-value choice
+/// when it took ours. A shape we do not know counts as yes.
+fn max_allows_no_limit(value: &Value) -> bool {
+    use spa::pod::ChoiceValue;
+    use spa::utils::ChoiceEnum;
+    match value {
+        Value::Fraction(f) => f.num == NO_LIMIT,
+        Value::Choice(ChoiceValue::Fraction(choice)) => match &choice.1 {
+            ChoiceEnum::None(f) => f.num == NO_LIMIT,
+            ChoiceEnum::Range { min, max, .. } | ChoiceEnum::Step { min, max, .. } => {
+                (min.num..=max.num).contains(&NO_LIMIT)
+            }
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => default.num == NO_LIMIT || alternatives.iter().any(|f| f.num == NO_LIMIT),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// The format with the producer's modifier choice settled: what a producer
@@ -287,6 +337,14 @@ fn fixate(
         },
         _ => return Err("an unexpected kind of modifier value".into()),
     };
+    // The producer's format carries our request only if it met it; if it
+    // took the plain alternative (see `with_fallback`), answer plain.
+    let unlimited = unlimited
+        && object
+            .properties
+            .iter()
+            .find(|p| p.key == F::VideoMaxFramerate.as_raw())
+            .is_none_or(|p| max_allows_no_limit(&p.value));
     let chosen = candidates
         .iter()
         .copied()
@@ -944,8 +1002,11 @@ fn run_inner(
                     }
                     (s.size != (0, 0)).then_some(s.size)
                 };
-                let format = enum_format(size, st.borrow().options.unlimited_rate);
-                let mut params = [Pod::from_bytes(&format).expect("format pod")];
+                let formats = enum_format_list(size, st.borrow().options.unlimited_rate);
+                let mut params: Vec<&Pod> = formats
+                    .iter()
+                    .map(|f| Pod::from_bytes(f).expect("format pod"))
+                    .collect();
                 if let Err(e) = stream.update_params(&mut params) {
                     st.borrow_mut().fail(format!("use shared memory: {e}"));
                 }
@@ -1175,6 +1236,7 @@ mod tests {
         ];
         let pods = enum_formats(None, false, &offer);
         assert_eq!(pods.len(), 2, "one dmabuf alternative, then shared memory");
+        assert_eq!(enum_formats(None, true, &offer).len(), 4);
         assert!(modifier_property(&pods[0]).is_some());
         assert!(modifier_property(&pods[1]).is_none());
         assert_eq!(enum_formats(None, false, &[]).len(), 1);
@@ -1212,37 +1274,82 @@ mod tests {
     }
 
     #[test]
-    fn a_monitor_stream_asks_for_no_frame_rate_limit_in_every_form() {
+    fn a_monitor_stream_asks_for_no_frame_rate_limit_and_then_without() {
         // Mutter limits a monitor stream to the maximum it settles on, which
         // is its own offer (the refresh rate) unless we name one; zero is
         // the only value it does not limit by. Shared memory, dmabuf, the
-        // fixed size and the fixated answer alike.
+        // fixed size and the fixated answer alike, each with the plain form
+        // after it for a Mutter that cannot meet the request.
         let offer = [(DrmFourcc::Xrgb8888, TILED.to_vec())];
         let mut forms = enum_formats(None, true, &offer);
-        forms.push(enum_format(Some((1280, 720)), true));
-        let producer = format_pod(
+        forms.extend(enum_format_list(Some((1280, 720)), true));
+        assert_eq!(
+            forms.len(),
+            6,
+            "dmabuf and shared memory, twice each, then 2"
+        );
+        for pair in forms.chunks(2) {
+            let max = max_framerate(&pair[0]).expect("a max frame rate");
+            assert!(
+                matches!(max, Value::Fraction(Fraction { num: 0, denom: 1 })),
+                "{max:?}"
+            );
+            assert!(max_framerate(&pair[1]).is_none(), "the plain alternative");
+        }
+        // The fixated answer repeats the request only when what the producer
+        // handed back allows it: the one-value choice that a Mutter 50.6
+        // returns after taking ours (seen on hardware), and a range that
+        // starts at 1, which is what Mutter 46's own offer would leave.
+        let producer_with = |max: spa::pod::ChoiceValue| {
+            let mut format = object(&format_pod(
+                Some((1920, 1080)),
+                false,
+                &[VideoFormat::BGRx],
+                Mods::Offer(&TILED),
+            ));
+            format.properties.push(Property::new(
+                spa::param::format::FormatProperties::VideoMaxFramerate.as_raw(),
+                Value::Choice(max),
+            ));
+            serialize(format)
+        };
+        let one = |num| {
+            producer_with(spa::pod::ChoiceValue::Fraction(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::None(Fraction { num, denom: 1 }),
+            )))
+        };
+        let range = |min| {
+            producer_with(spa::pod::ChoiceValue::Fraction(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Range {
+                    default: Fraction { num: 60, denom: 1 },
+                    min: Fraction { num: min, denom: 1 },
+                    max: Fraction { num: 60, denom: 1 },
+                },
+            )))
+        };
+        let met = format_pod(
             Some((1920, 1080)),
             true,
             &[VideoFormat::BGRx],
             Mods::Offer(&TILED),
         );
-        forms.push(
-            fixate(
+        for (producer, expected) in [
+            (met, true),
+            (one(NO_LIMIT), true),
+            (range(0), true),
+            (range(1), false),
+        ] {
+            let answer = fixate(
                 Pod::from_bytes(&producer).unwrap(),
                 VideoFormat::BGRx,
                 (1920, 1080),
                 &TILED,
                 true,
             )
-            .unwrap(),
-        );
-        assert_eq!(forms.len(), 4);
-        for form in forms {
-            let max = max_framerate(&form).expect("a max frame rate");
-            assert!(
-                matches!(max, Value::Fraction(Fraction { num: 0, denom: 1 })),
-                "{max:?}"
-            );
+            .unwrap();
+            assert_eq!(max_framerate(&answer).is_some(), expected);
         }
     }
 
