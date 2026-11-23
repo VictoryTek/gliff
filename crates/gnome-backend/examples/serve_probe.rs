@@ -787,6 +787,25 @@ async fn run(
         healthy &= fail("cursor shape", "none received");
     }
 
+    // SERVE_PROBE_PAUSE=SECS waits before the first resize, so that a window
+    // put on the private screen has settled there (see `gliff-gnome-animate`
+    // with maximized or floating).
+    if headless && load.is_none() {
+        if let Some(secs) = std::env::var("SERVE_PROBE_PAUSE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s <= 600)
+        {
+            println!("waiting {secs} s before the first resize");
+            let end = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < end {
+                if let Err(e) = c.step(Duration::from_millis(200)).await {
+                    return fail("pause", e);
+                }
+            }
+        }
+    }
+
     // The resize and scale steps change the screen under a --load run.
     if headless && load.is_none() {
         for (w, h) in [(1280u32, 720u32), (1600, 900)] {

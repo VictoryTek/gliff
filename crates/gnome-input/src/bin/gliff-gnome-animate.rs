@@ -2,7 +2,7 @@
 //! session under load: every capture frame of the monitor it covers differs
 //! from the one before, as in video, a game or fast scrolling.
 //!
-//!   gliff-gnome-animate [SECS [RECTS|solid:RRGGBB [CONNECTOR]]]
+//!   gliff-gnome-animate [SECS [RECTS|solid:RRGGBB [CONNECTOR [HOW]]]]
 //!                                 run for SECS seconds (default 60), drawing
 //!                                 RECTS coloured rectangles a frame (default
 //!                                 300), then print how many frames it drew
@@ -14,7 +14,16 @@
 //!                                 With CONNECTOR (a name or its start, such
 //!                                 as Meta- for a private screen) it waits up
 //!                                 to 30 s for that monitor and covers it,
-//!                                 not the primary one
+//!                                 not the primary one. HOW is fullscreen
+//!                                 (the default; the window is put back on
+//!                                 the monitor when it leaves it), or
+//!                                 maximized or floating: the window starts
+//!                                 fullscreen there, is then let out of it,
+//!                                 and is only watched. It counts once the
+//!                                 window has been seen on the monitor for
+//!                                 1.6 s after that; the end of the run says
+//!                                 when that was and how often, and when, the
+//!                                 window left the monitor after it
 //!
 //! It draws the rectangles and a sweeping bar per frame, so the picture is
 //! busy enough to need real bit rate from the encoder. More rectangles cost
@@ -113,6 +122,13 @@ fn main() {
         std::process::exit(2);
     }
     let connector = std::env::args().nth(3);
+    let how = std::env::args()
+        .nth(4)
+        .unwrap_or_else(|| "fullscreen".into());
+    if !["fullscreen", "maximized", "floating"].contains(&how.as_str()) {
+        println!("[FAIL] argument: HOW is fullscreen, maximized or floating");
+        std::process::exit(2);
+    }
     if gtk4::init().is_err() {
         println!("[FAIL] gtk: cannot open a display");
         std::process::exit(1);
@@ -199,14 +215,40 @@ fn main() {
     // Mutter has been seen to move the window off it. With a CONNECTOR, put it
     // back, and count how often that was needed.
     let moved_back = Rc::new(Cell::new(0u32));
+    // For a window that is let out of fullscreen: how often it left the
+    // monitor, and where it was last seen.
+    let left = Rc::new(Cell::new(0u32));
+    let last_on = Rc::new(RefCell::new(String::new()));
+    // When the window had settled on the monitor, and when it first left it
+    // after that (seconds from the start).
+    let armed_at = Rc::new(Cell::new(None::<f64>));
+    // Every change of the monitor the window is on after that, with the time.
+    let trail = Rc::new(RefCell::new(Vec::<(f64, String)>::new()));
+    let first_left_at = Rc::new(Cell::new(None::<f64>));
     {
         let main_loop = main_loop.clone();
         let (window, moved_back, connector) =
             (window.clone(), moved_back.clone(), connector.clone());
+        let (left, last_on, how) = (left.clone(), last_on.clone(), how.clone());
+        let (armed_at, first_left_at) = (armed_at.clone(), first_left_at.clone());
+        let trail = trail.clone();
+        let released = Cell::new(false);
+        let was_on = Cell::new(true);
+        let settled = Cell::new(0u32);
         gtk4::glib::timeout_add_local(Duration::from_millis(200), move || {
             if started.elapsed() >= Duration::from_secs(secs) {
                 main_loop.quit();
                 return gtk4::glib::ControlFlow::Break;
+            }
+            if how != "fullscreen"
+                && !released.get()
+                && started.elapsed() >= Duration::from_millis(1500)
+            {
+                released.set(true);
+                window.unfullscreen();
+                if how == "maximized" {
+                    window.maximize();
+                }
             }
             if let (Some(want), Some(display)) =
                 (connector.as_deref(), gtk4::gdk::Display::default())
@@ -220,9 +262,38 @@ fn main() {
                     .and_then(|surface| display.monitor_at_surface(&surface))
                     .and_then(|m| m.connector());
                 if let Some(target) = target {
-                    if on.as_deref() != target.connector().as_deref() {
-                        window.fullscreen_on_monitor(&target);
-                        moved_back.set(moved_back.get() + 1);
+                    let here = on.as_deref() == target.connector().as_deref();
+                    if how == "fullscreen" {
+                        if !here {
+                            window.fullscreen_on_monitor(&target);
+                            moved_back.set(moved_back.get() + 1);
+                        }
+                    } else if released.get() {
+                        // A missing monitor (the surface is between monitors)
+                        // is no sample; the last known place is kept.
+                        if let Some(name) = on.as_deref() {
+                            *last_on.borrow_mut() = name.to_string();
+                            if armed_at.get().is_none() {
+                                // Settled: eight samples in a row on the monitor.
+                                settled.set(if here { settled.get() + 1 } else { 0 });
+                                if settled.get() >= 8 {
+                                    armed_at.set(Some(started.elapsed().as_secs_f64()));
+                                }
+                            } else {
+                                let mut t = trail.borrow_mut();
+                                if t.last().is_none_or(|(_, n)| n != name) {
+                                    t.push((started.elapsed().as_secs_f64(), name.to_string()));
+                                }
+                                drop(t);
+                                if was_on.get() && !here {
+                                    left.set(left.get() + 1);
+                                    if first_left_at.get().is_none() {
+                                        first_left_at.set(Some(started.elapsed().as_secs_f64()));
+                                    }
+                                }
+                                was_on.set(here);
+                            }
+                        }
                     }
                 }
             }
@@ -237,8 +308,31 @@ fn main() {
         "drew {n} frames in {secs:.1} s ({:.1} per second)",
         f64::from(n) / secs
     );
-    if connector.is_some() {
+    if connector.is_some() && how == "fullscreen" {
         println!("moved back onto the monitor {} time(s)", moved_back.get());
+    } else if connector.is_some() {
+        match armed_at.get() {
+            None => println!(
+                "the {how} window never settled on the monitor after being let out of fullscreen; last seen on {:?}",
+                last_on.borrow()
+            ),
+            Some(t0) => println!(
+                "the {how} window settled on the monitor at {t0:.1} s; after that it left it {} time(s){}; last seen on {:?}",
+                left.get(),
+                first_left_at
+                    .get()
+                    .map_or(String::new(), |t| format!(", the first time at {t:.1} s")),
+                last_on.borrow()
+            ),
+        }
+        let trail = trail.borrow();
+        if !trail.is_empty() {
+            let steps: Vec<String> = trail
+                .iter()
+                .map(|(t, n)| format!("{n} at {t:.1} s"))
+                .collect();
+            println!("monitor changes after settling: {}", steps.join(", then "));
+        }
     }
     let p = presented.borrow();
     println!(

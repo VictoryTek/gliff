@@ -279,13 +279,22 @@ show up when you use it:
   copy as new, and the bridge ping-pongs (about 4,600 requests in four
   minutes, one "Pasting text" notification each). For a one-machine test
   start the viewer with `--no-clipboard`.
-- Windows on a private screen can be moved off it when its mode changes (a
-  resize or scale change of the viewer). Seen with the fullscreen test window
-  of `gliff-gnome-animate` on a desktop that also has physical monitors: Mutter
-  put it on another monitor in most steps, and the tool, given the monitor's
-  name, puts itself back and counts the times (6 to 13 in a run of nine steps).
-  Not checked with ordinary windows, or on a host whose only monitor is the
-  private screen.
+- A resize or scale change of a private screen makes Mutter give the one
+  virtual monitor a new mode and reload its monitor configuration
+  (`ensure_virtual_monitor` in its virtual stream source), and while that
+  happens windows on it are reported on another monitor. Seen on a desktop that
+  also has physical monitors, with the test window of `gliff-gnome-animate`:
+  a fullscreen window set to the private screen stays off it until it is put
+  back (6 to 13 times in a run of nine steps; until then a decode check saw
+  the desktop background), while a maximized or a floating window that had
+  settled on the private screen was reported on a physical monitor at the
+  first resize, and again at the second in the two runs that printed the
+  trail (about 0.2 to 0.4 s each), and was back on the private screen each
+  time (six runs in all, two with the trail; the number of departures counted
+  was 1 in four runs and 2 in the two with the trail, and the 200 ms sampling
+  can miss or merge short hops). A window's position and size after it
+  returns, other applications' windows, and a host whose only monitor is the
+  private screen were not checked.
 - A private (`--headless`) screen follows the viewer's scale, as far as
   Mutter allows it (the nearest scale the mode supports, and none that leaves
   under 800x480 logical pixels). Tested on a real NVIDIA GPU; on the
