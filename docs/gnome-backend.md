@@ -211,7 +211,12 @@ change at the same size). It does not decode video unless asked: with
 picture to be that colour, within 16 on each channel, within 25 s (cover the
 screen with `gliff-gnome-animate 60 solid:RRGGBB CONNECTOR`, `CONNECTOR` being
 the mirrored monitor or `Meta-` for a private screen). It checks the colour
-and the picture size, not motion, sharpness or timing. With `--rich-clipboard` it
+and the picture size, not motion, sharpness or timing. `--decode-gpu` (with
+`--decode`) uses the viewer's GPU decoder instead (VA-API decode and the Vulkan
+recombine, read back); a debug build run outside the package needs the Vulkan
+loader on `LD_LIBRARY_PATH`, which the packaged binaries have built in. A
+change of the stream that only paces it (the frame-rate cap) keeps the decoder,
+as the viewer does. With `--rich-clipboard` it
 also moves an image, two files (one of 3 MB) and a folder through the server's
 clipboard in both directions, with a plain Mutter client playing the desktop's
 applications (it replaces the desktop's clipboard while it runs):

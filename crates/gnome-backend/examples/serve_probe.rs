@@ -53,6 +53,32 @@ fn fail(name: &str, detail: impl std::fmt::Display) -> bool {
     false
 }
 
+/// The decoder of `--decode`: the viewer's CPU one, or with `--decode-gpu`
+/// its GPU one (VA-API decode and the Vulkan recombine, read back).
+enum PictureDecoder {
+    Cpu(Box<gliff_sw::Decoder>),
+    Gpu(Box<gliff_vk::Decoder>, (u32, u32)),
+}
+
+/// A decoded picture: its size and BGRA pixels.
+type Picture = ((u32, u32), Vec<u8>);
+
+impl PictureDecoder {
+    /// The size and BGRA pixels of the next picture, if there is one.
+    fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
+        match self {
+            Self::Cpu(d) => d
+                .decode(main, aux)
+                .map(|f| f.map(|f| ((f.width, f.height), f.pixels)))
+                .map_err(|e| e.to_string()),
+            Self::Gpu(d, size) => d
+                .decode_to_bgra(main, aux)
+                .map(|f| f.map(|px| (*size, px)))
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Seen {
     frames: u64,
@@ -71,10 +97,18 @@ struct Seen {
     /// (r, g, b) of the middle of the last decoded picture with its size,
     /// how many pictures were decoded, and what went wrong.
     decode: bool,
-    decoder: Option<gliff_sw::Decoder>,
+    /// The GPU for `--decode-gpu`, opened once.
+    decode_gpu: Option<std::sync::Arc<gliff_vk::Gpu>>,
+    decoder: Option<PictureDecoder>,
+    /// What the decoder was made for: chroma mode and stream size.
+    decoder_for: Option<(ChromaMode, u32, u32)>,
     decoded: Option<((u32, u32), [f64; 3])>,
     decoded_count: u64,
     decode_errors: Vec<String>,
+    /// Frames after the last `StreamConfig`, and the first of them that was
+    /// a keyframe (its position among them, from 1).
+    frames_since_config: u64,
+    first_key_since_config: Option<u64>,
     cursor_shapes: u32,
     cursor: Option<(f64, f64, bool)>,
     /// Selections the server reported, by mime types.
@@ -129,22 +163,23 @@ impl Client {
                 if let Some(decoder) = self.seen.decoder.as_mut() {
                     let (main, aux) = payload.split_at(*data_len as usize);
                     match decoder.decode(main, aux) {
-                        Ok(Some(f)) => {
+                        Ok(Some(((w, h), px))) => {
                             self.seen.decoded_count += 1;
-                            self.seen.decoded = Some((
-                                (f.width, f.height),
-                                middle_colour(&f.pixels, f.width, f.height),
-                            ));
+                            self.seen.decoded = Some(((w, h), middle_colour(&px, w, h)));
                         }
                         Ok(None) => {}
                         Err(e) => {
                             if self.seen.decode_errors.len() < 5 {
-                                self.seen.decode_errors.push(e.to_string());
+                                self.seen.decode_errors.push(e);
                             }
                         }
                     }
                 }
                 self.seen.frames += 1;
+                self.seen.frames_since_config += 1;
+                if *keyframe && self.seen.first_key_since_config.is_none() {
+                    self.seen.first_key_since_config = Some(self.seen.frames_since_config);
+                }
                 self.seen.last_frame_id = *frame_id;
                 if let Some(log) = self.seen.frame_log.as_mut() {
                     log.push((
@@ -243,15 +278,29 @@ impl Client {
                 chroma,
                 ..
             } => {
-                if self.seen.decode {
-                    // As the viewer does: both stream kinds but the plain
-                    // 4:2:0 one have an auxiliary stream.
+                self.seen.frames_since_config = 0;
+                self.seen.first_key_since_config = None;
+                // As the viewer does: a change that only paces the stream (the
+                // frame-rate cap) keeps the decoder; a change of the coded
+                // stream makes a new one.
+                let coded = (*chroma, *width, *height);
+                if self.seen.decode
+                    && (self.seen.decoder_for != Some(coded) || self.seen.decoder.is_none())
+                {
+                    // Both stream kinds but the plain 4:2:0 one have an
+                    // auxiliary stream.
                     self.seen.decoded = None;
-                    self.seen.decoder = match gliff_sw::Decoder::new(
-                        *chroma != ChromaMode::Single420,
-                        *width,
-                        *height,
-                    ) {
+                    self.seen.decoder_for = Some(coded);
+                    let dual = *chroma != ChromaMode::Single420;
+                    let made = match &self.seen.decode_gpu {
+                        Some(gpu) => gliff_vk::Decoder::new(gpu, dual, *width, *height)
+                            .map(|d| PictureDecoder::Gpu(Box::new(d), (*width, *height)))
+                            .map_err(|e| e.to_string()),
+                        None => gliff_sw::Decoder::new(dual, *width, *height)
+                            .map(|d| PictureDecoder::Cpu(Box::new(d)))
+                            .map_err(|e| e.to_string()),
+                    };
+                    self.seen.decoder = match made {
                         Ok(d) => Some(d),
                         Err(e) => {
                             self.seen.decode_errors.push(format!("decoder: {e}"));
@@ -407,6 +456,16 @@ async fn main() {
         }
         extra.drain(i..(i + 2).min(extra.len()));
     }
+    // --decode-gpu: with --decode, decode on the GPU as the viewer does.
+    let mut decode_gpu = false;
+    if let Some(i) = extra.iter().position(|a| a == "--decode-gpu") {
+        if decode.is_none() {
+            eprintln!("--decode-gpu needs --decode RRGGBB");
+            std::process::exit(2);
+        }
+        decode_gpu = true;
+        extra.remove(i);
+    }
     let healthy = run(
         &server,
         &extra,
@@ -415,7 +474,7 @@ async fn main() {
         rich,
         soak,
         load.map(|l| (l, stall)),
-        decode,
+        decode.map(|colour| (colour, decode_gpu)),
     )
     .await;
     std::process::exit(if healthy { 0 } else { 1 });
@@ -430,7 +489,7 @@ async fn run(
     rich: bool,
     soak_secs: Option<u64>,
     load: Option<(u64, Option<u64>)>,
-    decode: Option<[u8; 3]>,
+    decode: Option<([u8; 3], bool)>,
 ) -> bool {
     let before = match monitor_names() {
         Ok(n) => n,
@@ -461,11 +520,28 @@ async fn run(
         }
         lines
     });
+    let decode_gpu = match decode {
+        Some((_, true)) => {
+            let node = std::env::var_os("GLIFF_RENDER_NODE").map(std::path::PathBuf::from);
+            match gliff_vk::Gpu::open(node.as_deref()) {
+                Ok(gpu) if gpu.can_decode() => Some(gpu),
+                Ok(gpu) => {
+                    return fail(
+                        "decode gpu",
+                        format!("{} has no VA-API H.264 decoder", gpu.name),
+                    )
+                }
+                Err(e) => return fail("decode gpu", format!("{e:#}")),
+            }
+        }
+        _ => None,
+    };
     let mut c = Client {
         rd: Framed::new(child.stdout.take().expect("stdout")),
         wr: Framed::new(child.stdin.take().expect("stdin")),
         seen: Seen {
             decode: decode.is_some(),
+            decode_gpu,
             ..Seen::default()
         },
     };
@@ -527,7 +603,7 @@ async fn run(
         Err(e) => return fail("first frame", e),
     }
 
-    if let Some(want) = decode {
+    if let Some((want, _)) = decode {
         // The first pictures may be what was on the screen before the
         // coloured window came up: wait for the colour.
         let hit = |s: &Seen| {
@@ -537,10 +613,15 @@ async fn run(
         match c.until(Duration::from_secs(25), hit).await {
             Ok(true) => {
                 let (size, m) = c.seen.decoded.unwrap_or_default();
+                let on = if c.seen.decode_gpu.is_some() {
+                    "GPU"
+                } else {
+                    "CPU"
+                };
                 ok(
                     "decoded picture",
                     format!(
-                        "{size:?}, middle rgb ({:.0}, {:.0}, {:.0}) for wanted {:02x}{:02x}{:02x}; {} pictures decoded, {} decode errors",
+                        "on the {on} decoder, {size:?}, middle rgb ({:.0}, {:.0}, {:.0}) for wanted {:02x}{:02x}{:02x}; {} pictures decoded, {} decode errors",
                         m[0], m[1], m[2], want[0], want[1], want[2],
                         c.seen.decoded_count, c.seen.decode_errors.len()
                     ),
@@ -550,9 +631,10 @@ async fn run(
                 healthy &= fail(
                     "decoded picture",
                     format!(
-                        "last {:?} for wanted {:02x}{:02x}{:02x} within 25 s; {} decoded, errors {:?}",
+                        "last {:?} for wanted {:02x}{:02x}{:02x} within 25 s; {} decoded, errors {:?}; {} stream config(s), {} frame(s) since the last, first keyframe among them at {:?}",
                         c.seen.decoded, want[0], want[1], want[2],
-                        c.seen.decoded_count, c.seen.decode_errors
+                        c.seen.decoded_count, c.seen.decode_errors,
+                        c.seen.configs, c.seen.frames_since_config, c.seen.first_key_since_config
                     ),
                 );
             }
