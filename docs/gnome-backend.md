@@ -128,7 +128,8 @@ what the field received:
 
 ```
 gliff-gnome-layout-probe      # run on a machine nobody is using
-gliff-gnome-layout-probe fr   # only the scenarios for the named viewer layouts
+gliff-gnome-layout-probe fr   # only the scenarios for the named viewer layouts; it also prints
+                              # how keys go and how far each server layout is from the viewer's
 ```
 
 A server with several layouts: the viewer's layout is compared with each of
@@ -136,9 +137,15 @@ them. If it is none of them, key codes would be wrong whichever is active, so
 the keysym mode above is used (Mutter looks the keysym up in the layout in
 use). If it is one of them, key codes are kept, as the active layout is not
 known here, so a viewer on the server's second layout while the first is
-active is typed with the first (not helped; on the test desktop a German
-viewer on a us+de server was typed correctly anyway, see "Several layouts on
-the server" in `docs/PLAN.md`).
+active is typed with the first (not helped: a German viewer on a us+de server
+with `us` active typed `yz` for `zy`, measured; see "Several layouts on the
+server" in `docs/PLAN.md`).
+
+Layouts are compared on the keys that type text. Two machines with different
+xkeyboard-config versions give the same layout different function and vendor
+keys (F23 against a media key, five `I60x` keys one has and the other lacks),
+and comparing every key took a viewer on the very same layout for another one
+and sent keysyms instead of key codes.
 
 ## `gnome-clipboard`
 

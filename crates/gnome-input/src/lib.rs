@@ -65,6 +65,11 @@ impl ServerKeymap {
         self.snapshot().1.is_some()
     }
 
+    /// The layout as xkb text, once it has arrived (probes print it).
+    pub fn text(&self) -> Option<String> {
+        self.snapshot().1
+    }
+
     fn set(&self, text: String) {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
         inner.0 += 1;
@@ -117,6 +122,11 @@ impl Input {
     pub fn with_server_keymap(mut self, server: ServerKeymap) -> Self {
         self.server = server;
         self
+    }
+
+    /// How keys go now, once a viewer layout has been set (probes print it).
+    pub fn key_mode(&self) -> Option<KeyMode> {
+        self.state.lock().ok()?.key_mode()
     }
 
     pub fn send(&self, cmd: InputCmd) -> Result<()> {

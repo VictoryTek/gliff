@@ -655,6 +655,66 @@ mod tests {
     }
 
     #[test]
+    fn layouts_that_differ_only_in_function_and_vendor_keys_are_the_same() {
+        // Seen on hardware: the same `us` layout read by two machines with
+        // different xkeyboard-config versions differed in F23 and five vendor
+        // keys, and the viewer's layout was taken for another one.
+        use xkbcommon::xkb;
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let compile = |text: String| {
+            xkb::Keymap::new_from_string(
+                &ctx,
+                text,
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .expect("compile")
+        };
+        // A layout with one more definition at the end of the symbols (a
+        // later definition of a key wins).
+        let with_key = |name: &str, definition: &str| {
+            let text = layout(name);
+            let at = text.find("xkb_symbols").expect("symbols");
+            let close = at + text[at..].find("\n};").expect("close") + 1;
+            compile(format!(
+                "{}\t{definition}\n{}",
+                &text[..close],
+                &text[close..]
+            ))
+        };
+        let with_options = |name: &str, options: &str| {
+            xkb::Keymap::new_from_names(
+                &ctx,
+                "",
+                "",
+                name,
+                "",
+                Some(options.to_owned()),
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .expect("compile")
+        };
+        let us = compile(layout("us"));
+        let fr = compile(layout("fr"));
+        let same = crate::keymap::same_layout_for_tests;
+        assert!(same(
+            &us,
+            &with_key("us", "key <FK23> { [ XF86Tools, XF86Assistant ] };")
+        ));
+        // Where one database has a vendor key and the other none.
+        assert!(same(&us, &with_key("us", "key <I602> { [ XF86Tools ] };")));
+        // Keys that type, or change what is typed, still count: a letter, a
+        // dead key (it makes a different character), Compose, a modifier.
+        assert!(!same(&us, &with_key("us", "key <AC01> { [ b, B ] };")));
+        assert!(!same(
+            &fr,
+            &with_key("fr", "key <AD11> { [ dead_acute, dead_diaeresis ] };")
+        ));
+        assert!(!same(&us, &with_options("us", "compose:menu")));
+        assert!(!same(&us, &with_options("us", "ctrl:swapcaps")));
+    }
+
+    #[test]
     fn without_a_viewer_layout_keys_go_as_codes() {
         assert_eq!(
             key(&mut t(), KEY_A, true),

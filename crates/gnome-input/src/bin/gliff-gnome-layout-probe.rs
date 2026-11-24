@@ -224,6 +224,76 @@ fn layout_text(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("cannot compile layout {name}"))
 }
 
+/// For the log: how many layouts the server's keymap has, and for each how
+/// many keys differ from the viewer's first layout (0 means the viewer's
+/// layout counts as that one, which keeps key codes).
+fn describe(viewer: &str, server: &str) -> String {
+    let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let compile = |text: &str| {
+        xkb::Keymap::new_from_string(
+            &ctx,
+            text.to_owned(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+    };
+    let (Some(v), Some(s)) = (compile(viewer), compile(server)) else {
+        return "cannot compile a keymap".into();
+    };
+    let lo = v.min_keycode().raw().min(s.min_keycode().raw());
+    let hi = v.max_keycode().raw().max(s.max_keycode().raw());
+    let groups: Vec<String> = (0..s.num_layouts())
+        .map(|g| {
+            let differ: Vec<xkb::Keycode> = (lo..=hi)
+                .map(xkb::Keycode::new)
+                .filter(|&key| {
+                    let levels = v.num_levels_for_key(key, 0);
+                    !(levels == s.num_levels_for_key(key, g)
+                        && (0..levels).all(|l| {
+                            v.key_get_syms_by_level(key, 0, l) == s.key_get_syms_by_level(key, g, l)
+                        }))
+                })
+                .collect();
+            // A handful of keys: name them, that is the interesting case.
+            let which = if differ.len() <= 8 {
+                let names: Vec<String> = differ
+                    .iter()
+                    .map(|&k| {
+                        let syms = |m: &xkb::Keymap, g| {
+                            (0..m.num_levels_for_key(k, g))
+                                .map(|l| {
+                                    m.key_get_syms_by_level(k, g, l)
+                                        .iter()
+                                        .map(|x| xkb::keysym_get_name(*x))
+                                        .collect::<Vec<_>>()
+                                        .join("+")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        };
+                        format!(
+                            "{} {} viewer [{}] server [{}]",
+                            k.raw(),
+                            v.key_get_name(k).unwrap_or("?"),
+                            syms(&v, 0),
+                            syms(&s, g)
+                        )
+                    })
+                    .collect();
+                format!(" ({})", names.join("; "))
+            } else {
+                String::new()
+            };
+            format!(
+                "{:?}: {} keys differ{which}",
+                s.layout_get_name(g),
+                differ.len()
+            )
+        })
+        .collect();
+    format!("server layouts {}", groups.join(", "))
+}
+
 /// What the worker asks the window thread for.
 enum Request {
     /// Read the text field and empty it.
@@ -312,6 +382,7 @@ fn work(requests: Sender<Request>) -> bool {
         );
     }
     ok("server layout", "read from the compositor");
+    let server_text = server.text();
     let input = Input::new(ses.input(), stream.path(), extent).with_server_keymap(server);
 
     // Give the window time to appear, then click into it.
@@ -379,6 +450,14 @@ fn work(requests: Sender<Request>) -> bool {
             Ok(take())
         })();
         let _ = input.send(InputCmd::ReleaseAll);
+        if let (Ok(viewer), Some(server)) = (layout_text(s.layout), server_text.as_deref()) {
+            println!(
+                "       {} keys go as {:?}; {}",
+                s.layout,
+                input.key_mode(),
+                describe(&viewer, server)
+            );
+        }
         match result {
             Ok(got) if got == s.expect => ok(s.what, format!("{got:?}")),
             Ok(got) if s.known_limit && got.is_empty() => ok(

@@ -126,13 +126,37 @@ fn plain(sym: u32) -> u32 {
     }
 }
 
+/// Whether the key has nothing but function keys, media and vendor keys
+/// (or nothing at all) on every level of `group`.
+fn inert(map: &xkb::Keymap, key: xkb::Keycode, group: u32) -> bool {
+    use xkbcommon::xkb::keysyms::{KEY_F1, KEY_F35};
+    // XF86 keys: the VT switches and the long-standing ones (0x1008fe01 to
+    // 0x1008ffff), and the newer ones such as XF86Assistant (0x10081000 up).
+    const XF86: [std::ops::RangeInclusive<u32>; 2] =
+        [0x1008_fe00..=0x1008_ffff, 0x1008_1000..=0x1008_1fff];
+    (0..map.num_levels_for_key(key, group)).all(|l| {
+        map.key_get_syms_by_level(key, group, l).iter().all(|s| {
+            let raw = s.raw();
+            (KEY_F1..=KEY_F35).contains(&raw) || XF86.iter().any(|r| r.contains(&raw))
+        })
+    })
+}
+
 /// Whether `a`'s first layout gives every key the same symbols, on every
-/// level, as layout `group` of `b`.
+/// level, as layout `group` of `b`, leaving out the keys that carry only
+/// function, media and vendor symbols (or none) in both: two machines with
+/// different versions of xkeyboard-config differ there while the layout is the
+/// same one (F23 against a media key, vendor keys one database has and the
+/// other lacks), and nothing typed depends on them. Dead keys, Compose and
+/// modifiers are compared like the rest.
 fn same_layout(a: &xkb::Keymap, b: &xkb::Keymap, group: u32) -> bool {
     let lo = a.min_keycode().raw().min(b.min_keycode().raw());
     let hi = a.max_keycode().raw().max(b.max_keycode().raw());
     (lo..=hi).all(|raw| {
         let key = xkb::Keycode::new(raw);
+        if inert(a, key, 0) && inert(b, key, group) {
+            return true;
+        }
         let levels = a.num_levels_for_key(key, 0);
         levels == b.num_levels_for_key(key, group)
             && (0..levels).all(|l| {
