@@ -269,8 +269,10 @@ every few seconds (sizes and scales up to 4K at scale 2), and prints the
 server's memory, open files and threads after every full cycle of sizes; it
 fails on a resize without the stream asked for and a frame, or on growth beyond a margin after the first
 cycle, which is a tolerance and not a leak detector (a first 8-minute run on
-the NVIDIA desktop showed no growth, and a 5-minute one with per-cycle
-samples held flat to 4 kB; hours would be needed to say more).
+the NVIDIA desktop showed no growth, a 5-minute one with per-cycle samples
+held flat to 4 kB, and a one-hour run, 1086 resizes, ended 76 kB above its
+591-second sample; see "Soak" in `docs/PLAN.md`; several hours have not been
+run).
 
 ## The viewer on GNOME
 
