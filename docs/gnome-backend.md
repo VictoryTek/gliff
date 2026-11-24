@@ -141,11 +141,14 @@ active is typed with the first (not helped: a German viewer on a us+de server
 with `us` active typed `yz` for `zy`, measured; see "Several layouts on the
 server" in `docs/PLAN.md`).
 
-Layouts are compared on the keys that type text. Two machines with different
-xkeyboard-config versions give the same layout different function and vendor
-keys (F23 against a media key, five `I60x` keys one has and the other lacks),
-and comparing every key took a viewer on the very same layout for another one
-and sent keysyms instead of key codes.
+Layouts are compared on every key except the extension keys (F13 and up, media,
+vendor) that carry only function, media and vendor symbols (or none) in both. Two machines with different
+xkeyboard-config versions give the same layout different keys there (F23
+against a media key, five `I60x` keys one has and the other lacks), and
+comparing every key took a viewer on the very same layout for another one and
+sent keysyms instead of key codes. Dead keys, Compose, modifiers and F1 to F12
+are still compared; a media key the viewer remapped to another one is not told
+apart.
 
 ## `gnome-clipboard`
 

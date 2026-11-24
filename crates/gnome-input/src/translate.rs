@@ -710,6 +710,8 @@ mod tests {
             &fr,
             &with_key("fr", "key <AD11> { [ dead_acute, dead_diaeresis ] };")
         ));
+        // An F key of the main block remapped is a difference.
+        assert!(!same(&us, &with_key("us", "key <FK01> { [ F2 ] };")));
         assert!(!same(&us, &with_options("us", "compose:menu")));
         assert!(!same(&us, &with_options("us", "ctrl:swapcaps")));
     }

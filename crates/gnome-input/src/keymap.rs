@@ -126,6 +126,11 @@ fn plain(sym: u32) -> u32 {
     }
 }
 
+/// The first key code of the extension keys: F13 and above, the media and
+/// vendor keys. The keys below it (letters, F1 to F12, the keypad) are the
+/// same on every keyboard database, so a difference there is a real one.
+const FIRST_EXTENSION_KEY: u32 = 191;
+
 /// Whether the key has nothing but function keys, media and vendor keys
 /// (or nothing at all) on every level of `group`.
 fn inert(map: &xkb::Keymap, key: xkb::Keycode, group: u32) -> bool {
@@ -143,18 +148,20 @@ fn inert(map: &xkb::Keymap, key: xkb::Keycode, group: u32) -> bool {
 }
 
 /// Whether `a`'s first layout gives every key the same symbols, on every
-/// level, as layout `group` of `b`, leaving out the keys that carry only
-/// function, media and vendor symbols (or none) in both: two machines with
-/// different versions of xkeyboard-config differ there while the layout is the
-/// same one (F23 against a media key, vendor keys one database has and the
-/// other lacks), and nothing typed depends on them. Dead keys, Compose and
-/// modifiers are compared like the rest.
+/// level, as layout `group` of `b`, leaving out the extension keys (F13 and
+/// up, media, vendor) that carry only function, media and vendor symbols (or
+/// none) in both: two machines with different versions of xkeyboard-config
+/// differ there while the layout is the same one (F23 against a media key,
+/// vendor keys one database has and the other lacks), and nothing typed
+/// depends on them. Dead keys, Compose, modifiers and F1 to F12 are compared
+/// like the rest. Not told apart: a media key the viewer has remapped to
+/// another media key; it goes as the server's own mapping.
 fn same_layout(a: &xkb::Keymap, b: &xkb::Keymap, group: u32) -> bool {
     let lo = a.min_keycode().raw().min(b.min_keycode().raw());
     let hi = a.max_keycode().raw().max(b.max_keycode().raw());
     (lo..=hi).all(|raw| {
         let key = xkb::Keycode::new(raw);
-        if inert(a, key, 0) && inert(b, key, group) {
+        if raw >= FIRST_EXTENSION_KEY && inert(a, key, 0) && inert(b, key, group) {
             return true;
         }
         let levels = a.num_levels_for_key(key, 0);
