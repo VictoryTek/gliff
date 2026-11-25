@@ -12,6 +12,10 @@
 //!
 //! `gliff-gnome-layout-probe [LAYOUT...]` runs only the scenarios for the
 //! named viewer layouts (`us`, `de`, `fr`, `ru`); with none it runs them all.
+//! With `LAYOUT_PROBE_SWITCH=1` it first presses Super+Space on the desktop
+//! (GNOME's default shortcut to switch layout, when there are several) and
+//! waits up to 3 s for the server to see the layout in use change, printing it
+//! before and after; it fails if the keys cannot be sent or nothing changes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -413,6 +417,56 @@ fn work(requests: Sender<Request>) -> bool {
         return fail("click", e);
     }
     std::thread::sleep(Duration::from_millis(400));
+    // `LAYOUT_PROBE_SWITCH=1`: switch the desktop's layout the way a viewer
+    // user would (Super+Space, as key codes, before any viewer layout is
+    // set), and wait up to 3 s for the server to see the layout in use
+    // change. It fails when the keys cannot be sent or no change is seen
+    // (one layout, the shortcut off or rebound), so a run that was meant to
+    // test a switch cannot pass without one.
+    if std::env::var("LAYOUT_PROBE_SWITCH").is_ok_and(|v| v == "1") {
+        const KEY_LEFTMETA: u32 = 125;
+        let before = in_use.active_layout();
+        let mut sent = Ok(());
+        for (code, pressed) in [
+            (KEY_LEFTMETA, true),
+            (KEY_SPACE, true),
+            (KEY_SPACE, false),
+            (KEY_LEFTMETA, false),
+        ] {
+            // A failed press still gets its releases tried.
+            if sent.is_ok() || !pressed {
+                if let Err(e) = input.send(InputCmd::Key { code, pressed }) {
+                    sent = Err(format!("{e:#}"));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let _ = input.send(InputCmd::ReleaseAll);
+        if let Err(e) = sent {
+            return fail("switch", format!("Super+Space could not be sent: {e}"));
+        }
+        let mut after = in_use.active_layout();
+        for _ in 0..30 {
+            if after.is_some() && after != before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            after = in_use.active_layout();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = take();
+        if after.is_none() || after == before {
+            return fail(
+                "switch",
+                format!(
+                    "Super+Space was sent but the layout in use did not change \
+                     ({before:?} -> {after:?}): one layout, the shortcut off, or the \
+                     layout in use not read"
+                ),
+            );
+        }
+        ok("switch", format!("layout in use {before:?} -> {after:?}"));
+    }
     // A first key proves the field has the keyboard.
     let _ = input.send(InputCmd::SetKeymap(layout_text("us").unwrap_or_default()));
     let _ = tap(&input, KEY_A);

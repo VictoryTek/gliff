@@ -130,6 +130,10 @@ what the field received:
 gliff-gnome-layout-probe      # run on a machine nobody is using
 gliff-gnome-layout-probe fr   # only the scenarios for the named viewer layouts; it also prints
                               # how keys go and how far each server layout is from the viewer's
+LAYOUT_PROBE_SWITCH=1 gliff-gnome-layout-probe de
+                              # first presses Super+Space (GNOME's default layout switch), waits
+                              # up to 3 s for the layout in use to change and prints it; fails if
+                              # it does not change (one layout, or the shortcut is off)
 ```
 
 A server with several layouts: the viewer's layout is compared with the one in
@@ -142,7 +146,7 @@ active source, and `sources` gives the groups' order. Both are read with the
 `dconf` command (it must be on the server's `PATH`, as `loginctl` is),
 `mru-sources` every 200 ms while the server has more than one layout (a
 single-layout server starts no process). A key typed within about 200 ms after
-a switch is still sent for the old layout. Keys held are let go when a switch
+a switch is still sent for the old layout. The layout probe was run on a real desktop with `us` and `de`; the results and what they leave out are in "The layout in use on a multi-layout server" in `docs/PLAN.md`. Keys held are let go when a switch
 changes how keys go. The first MRU entry is taken as the keymap's group only
 when the keymap agrees: input sources are not per window, every source is an
 `xkb` one, no two are the same, there are at most three, the stored list is
