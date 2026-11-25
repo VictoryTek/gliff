@@ -12,6 +12,7 @@ mod net;
 mod paintable;
 mod recent;
 mod theme;
+mod window_controls;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -296,6 +297,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         // click on an X in the middle of a remote session is a bad surprise.
         .decoration_layout("")
         .build();
+    window_controls::apply(&header);
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
         .width_chars(32)
