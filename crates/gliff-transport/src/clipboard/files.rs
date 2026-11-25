@@ -77,10 +77,16 @@ fn walk(
     if out.entries.len() >= MAX_FILE_ENTRIES {
         return Err(FilesError::TooMany(out.entries.len() + 1).into());
     }
+    // The wire format uses `/` whatever the host separator is.
     let rel_str = rel
-        .to_str()
-        .ok_or_else(|| FilesError::BadPath(rel.to_string_lossy().into_owned()))?
-        .to_string();
+        .components()
+        .map(|c| {
+            c.as_os_str()
+                .to_str()
+                .ok_or_else(|| FilesError::BadPath(rel.to_string_lossy().into_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
     if is_dir {
         out.entries.push(ClipboardFile {
             path: rel_str,
@@ -148,6 +154,7 @@ impl Spool {
         sweep_stale(base);
         // Pasted files can be private; the spool must not be readable by
         // other local users, whatever the umask.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
