@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use gnome_ipc::input::{AXIS_FINISH, AXIS_SOURCE_FINGER};
 use hypr_input::{Axis, InputCmd};
 
+use crate::active::ActiveLayout;
 use crate::keymap::ViewerKeys;
 
 /// One RemoteDesktop input call.
@@ -50,6 +51,8 @@ pub struct Translator {
     /// The server's own keymap, once known, and which version of it this is.
     server: Option<String>,
     server_generation: u64,
+    /// Which of the server's layouts is in use, when known.
+    active: Option<ActiveLayout>,
     buttons: BTreeSet<u32>,
     extent: (u32, u32),
     stopped: bool,
@@ -63,6 +66,7 @@ impl Translator {
             num_lock: true,
             server: None,
             server_generation: 0,
+            active: None,
             buttons: BTreeSet::new(),
             extent: (extent.0.max(1), extent.1.max(1)),
             stopped: false,
@@ -79,13 +83,34 @@ impl Translator {
     /// known). Returns the calls that let go of keys held under the old
     /// way of sending them, if it changes.
     pub fn set_server_keymap(&mut self, generation: u64, text: Option<String>) -> Vec<Call> {
-        if generation == self.server_generation {
+        self.update_server(generation, text, self.active)
+    }
+
+    /// The server's layout in use is `active` (`None` when not known).
+    #[cfg(test)]
+    pub(crate) fn set_active_layout(&mut self, active: Option<ActiveLayout>) -> Vec<Call> {
+        self.update_server(self.server_generation, self.server.clone(), active)
+    }
+
+    /// The server's keymap and the layout in use, taken together so that keys
+    /// are let go only if the way they go changes between the old pair and
+    /// the new one, not between half of each.
+    pub(crate) fn update_server(
+        &mut self,
+        generation: u64,
+        text: Option<String>,
+        active: Option<ActiveLayout>,
+    ) -> Vec<Call> {
+        if generation == self.server_generation && active == self.active {
             return Vec::new();
         }
-        self.server_generation = generation;
-        self.server = text;
+        if generation != self.server_generation {
+            self.server_generation = generation;
+            self.server = text;
+        }
+        self.active = active;
         match &mut self.viewer {
-            Some(v) => v.set_server(self.server.as_deref()),
+            Some(v) => v.set_server(self.server.as_deref(), self.active),
             None => Vec::new(),
         }
     }
@@ -190,7 +215,8 @@ impl Translator {
                 if self.viewer.as_ref().is_some_and(|v| v.text() == text) {
                     return Ok(Vec::new());
                 }
-                let next = ViewerKeys::new(&text, self.num_lock, self.server.as_deref())?;
+                let next =
+                    ViewerKeys::new(&text, self.num_lock, self.server.as_deref(), self.active)?;
                 let calls = self.release_keys();
                 self.viewer = Some(next);
                 calls
@@ -1046,6 +1072,122 @@ mod tests {
         assert_eq!(t.key_mode(), Some(crate::KeyMode::Keysyms));
         // The key at the position of A on a French keyboard types q.
         assert_eq!(key(&mut t, KEY_A, true), [sym(0x71, true)]);
+    }
+
+    fn active(group: u32, of: u32) -> Option<ActiveLayout> {
+        Some(ActiveLayout { group, of })
+    }
+
+    #[test]
+    fn a_viewer_on_the_servers_other_layout_sends_symbols_while_that_is_not_in_use() {
+        // Server us+de. The viewer's layout is the one in use: key codes. It
+        // is the other one: symbols, which Mutter finds in the layout in use.
+        for (viewer, group, mode) in [
+            ("us", 0, crate::KeyMode::Codes),
+            ("de", 0, crate::KeyMode::Keysyms),
+            ("us", 1, crate::KeyMode::Keysyms),
+            ("de", 1, crate::KeyMode::Codes),
+        ] {
+            let mut t = t();
+            t.set_server_keymap(1, Some(layout("us,de")));
+            t.set_active_layout(active(group, 2));
+            t.translate(InputCmd::SetKeymap(layout(viewer))).unwrap();
+            assert_eq!(
+                t.key_mode(),
+                Some(mode),
+                "{viewer} with group {group} in use"
+            );
+        }
+        // A German viewer's Z key, pressed where a US keyboard has Y, is `z`
+        // as a symbol (as code 21 it would type `y` on the us layout).
+        let mut t = t();
+        t.set_server_keymap(1, Some(layout("us,de")));
+        t.set_active_layout(active(0, 2));
+        t.translate(InputCmd::SetKeymap(layout("de"))).unwrap();
+        assert_eq!(key(&mut t, KEY_Y, true), [sym(0x7a, true)]);
+    }
+
+    #[test]
+    fn a_layout_in_use_that_does_not_fit_the_keymap_is_ignored() {
+        // Three sources against a two-layout keymap, or a group past the end:
+        // the old rule (any of the server's layouts) stands.
+        for bad in [active(0, 3), active(2, 2)] {
+            let mut t = t();
+            t.set_server_keymap(1, Some(layout("us,de")));
+            t.set_active_layout(bad);
+            t.translate(InputCmd::SetKeymap(layout("de"))).unwrap();
+            assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn switching_the_layout_in_use_lets_go_of_held_keys_and_changes_how_keys_go() {
+        let mut t = t();
+        t.set_server_keymap(1, Some(layout("us,de")));
+        t.set_active_layout(active(1, 2));
+        t.translate(InputCmd::SetKeymap(layout("de"))).unwrap();
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes));
+        assert_eq!(
+            key(&mut t, KEY_A, true),
+            [Call::Key {
+                code: KEY_A,
+                pressed: true
+            }]
+        );
+        // Super+Space on the viewer: the server's layout in use is now us.
+        let calls = t.set_active_layout(active(0, 2));
+        assert_eq!(
+            calls,
+            [Call::Key {
+                code: KEY_A,
+                pressed: false
+            }]
+        );
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Keysyms));
+        // The same value again changes nothing.
+        assert!(t.set_active_layout(active(0, 2)).is_empty());
+        // And back.
+        t.set_active_layout(active(1, 2));
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes));
+    }
+
+    #[test]
+    fn a_new_keymap_and_its_layout_in_use_arrive_together() {
+        // Old: us,de with de (group 1) in use. New: de,us with de (now group
+        // 0) in use. A German viewer's keys go as codes before and after;
+        // taking the new keymap with the old group would pass through
+        // keysyms and let go of the key held.
+        let mut t = t();
+        t.set_server_keymap(1, Some(layout("us,de")));
+        t.set_active_layout(active(1, 2));
+        t.translate(InputCmd::SetKeymap(layout("de"))).unwrap();
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes));
+        key(&mut t, KEY_A, true);
+        let calls = t.update_server(2, Some(layout("de,us")), active(0, 2));
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(t.key_mode(), Some(crate::KeyMode::Codes));
+        // Half of the change, the new keymap with the old group (1 is `us`
+        // there), is what the pair avoids: it would let go of the key.
+        let mut half = t_with_de_in_us_de();
+        let calls = half.set_server_keymap(2, Some(layout("de,us")));
+        assert_eq!(
+            calls,
+            [Call::Key {
+                code: KEY_A,
+                pressed: false
+            }]
+        );
+    }
+
+    /// A German viewer on a `us,de` server with `de` (group 1) in use, `a`
+    /// held.
+    fn t_with_de_in_us_de() -> Translator {
+        let mut t = t();
+        t.set_server_keymap(1, Some(layout("us,de")));
+        t.set_active_layout(active(1, 2));
+        t.translate(InputCmd::SetKeymap(layout("de"))).unwrap();
+        key(&mut t, KEY_A, true);
+        t
     }
 
     #[test]

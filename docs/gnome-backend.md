@@ -103,8 +103,8 @@ gliff-gnome-input-probe caps    # taps Caps Lock twice and checks it toggled and
 
 Keys go as keycodes, which Mutter reads with the server's layout, as long as
 the viewer's layout is the server's (or the viewer has sent none, or the
-server has several layouts and the viewer's is one of them, since the active
-one is not known here), so nothing changes for the common case. The server's layout is read from the compositor
+server has several layouts and the viewer's is the one in use, or, when the one
+in use is not known, one of them), so nothing changes for the common case. The server's layout is read from the compositor
 (a Wayland keyboard receives the seat's keymap, like the viewer reads its own).
 When the viewer's layout differs, every key goes through the viewer's layout on
 the server and is sent as the keysym it makes there (a German viewer's Y key is
@@ -132,14 +132,29 @@ gliff-gnome-layout-probe fr   # only the scenarios for the named viewer layouts;
                               # how keys go and how far each server layout is from the viewer's
 ```
 
-A server with several layouts: the viewer's layout is compared with each of
-them. If it is none of them, key codes would be wrong whichever is active, so
+A server with several layouts: the viewer's layout is compared with the one in
+use. If it is the same, key codes are kept; if not, key codes would be wrong, so
 the keysym mode above is used (Mutter looks the keysym up in the layout in
-use). If it is one of them, key codes are kept, as the active layout is not
-known here, so a viewer on the server's second layout while the first is
-active is typed with the first (not helped: a German viewer on a us+de server
-with `us` active typed `yz` for `zy`, measured; see "Several layouts on the
-server" in `docs/PLAN.md`).
+use). The layout in use is read from GNOME's settings. On an interactive
+switch the Shell writes the sources in most-recently-used order to
+`mru-sources` (`current` is deprecated and ignored), so the first entry is the
+active source, and `sources` gives the groups' order. Both are read with the
+`dconf` command (it must be on the server's `PATH`, as `loginctl` is),
+`mru-sources` every 200 ms while the server has more than one layout (a
+single-layout server starts no process). A key typed within about 200 ms after
+a switch is still sent for the old layout. Keys held are let go when a switch
+changes how keys go. The first MRU entry is taken as the keymap's group only
+when the keymap agrees: input sources are not per window, every source is an
+`xkb` one, no two are the same, there are at most three, the stored list is
+empty or holds every source, and the layout names in the keymap's
+`xkb_symbols` line are the sources' in order (with at most the locale's layout
+after them, which the Shell appends). When it is unknown (or `dconf` is
+missing, slow or failing), the earlier rule stands: the viewer's layout is
+compared with each of the server's, key codes if it is one of them, so a viewer
+on the server's second layout while the first is active is typed with the first
+(`us` active typed `yz` for `zy`, measured; see "Several layouts on the server"
+in `docs/PLAN.md`). Not covered: a switch made while IBus was not ready is not
+written by the Shell, so a stored list left stale that way is believed.
 
 Layouts are compared on every key except the extension keys (F13 and up, media,
 vendor) that carry only function, media and vendor symbols (or none) in both. Two machines with different

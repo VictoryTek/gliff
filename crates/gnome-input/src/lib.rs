@@ -10,11 +10,12 @@
 //! compositor, see [`ServerKeymap`]), keys are sent as the keysyms the viewer's
 //! layout makes (see [`keymap`]), so the characters are the viewer's.
 
+mod active;
 mod keymap;
 mod translate;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{anyhow, Result};
 use gnome_ipc::{GraphicalSession, InputPort};
@@ -26,7 +27,34 @@ pub use translate::{Call, Translator};
 /// what Mutter reads key codes with. Clone it to share it; every clone sees
 /// the same layout, and a change when the user switches layouts.
 #[derive(Clone, Default)]
-pub struct ServerKeymap(Arc<Mutex<(u64, Option<String>)>>);
+pub struct ServerKeymap(Arc<Mutex<Inner>>);
+
+#[derive(Clone, Default)]
+pub(crate) struct Inner {
+    /// Counts the keymaps that have arrived.
+    generation: u64,
+    text: Option<String>,
+    /// How many layouts `text` has, and their names (empty when the text does
+    /// not name them, or there is only one layout).
+    layouts: u32,
+    groups: Vec<String>,
+    /// Which of the keymap's layouts is in use, when known. Cleared when a
+    /// new keymap arrives: the groups may have been reordered.
+    active: Option<active::ActiveLayout>,
+}
+
+/// How many layouts (groups) a keymap text has; 0 if it does not compile.
+fn layout_count(text: &str) -> u32 {
+    use xkbcommon::xkb;
+    let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    xkb::Keymap::new_from_string(
+        &ctx,
+        text.to_owned(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .map_or(0, |k| k.num_layouts())
+}
 
 impl ServerKeymap {
     /// Not known: keys go as key codes.
@@ -53,10 +81,18 @@ impl ServerKeymap {
             display: Some(socket.to_string_lossy().into_owned()),
             instance: None,
         };
-        let sink = keymap.clone();
-        if let Err(e) = hypr_input::watch_keymap(target, Box::new(move |text| sink.set(text))) {
+        // The watcher lives as long as its compositor connection; it holds the
+        // keymap only weakly, so dropping the backend ends the layout poller.
+        let sink = keymap.downgrade();
+        let watch = Box::new(move |text: String| {
+            if let Some(keymap) = ServerKeymap::upgrade(&sink) {
+                keymap.set(text);
+            }
+        });
+        if let Err(e) = hypr_input::watch_keymap(target, watch) {
             tracing::warn!(error = %e, "cannot follow the server's keymap; keys go as key codes");
         }
+        active::follow(desktop.clone(), &keymap);
         keymap
     }
 
@@ -70,14 +106,59 @@ impl ServerKeymap {
         self.snapshot().1
     }
 
-    fn set(&self, text: String) {
-        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        inner.0 += 1;
-        inner.1 = Some(text);
+    /// Which layout is in use, as "group of layouts" (probes print it).
+    pub fn active_layout(&self) -> Option<(u32, u32)> {
+        self.snapshot().2.map(|a| (a.group, a.of))
     }
 
-    fn snapshot(&self) -> (u64, Option<String>) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// A layout given as xkb text, with the one in use (tests and probes).
+    pub fn fixed_active(text: &str, group: u32, of: u32) -> Self {
+        let keymap = Self::fixed(text);
+        let generation = keymap.snapshot().0;
+        keymap.set_active(generation, Some(active::ActiveLayout { group, of }));
+        keymap
+    }
+
+    fn set(&self, text: String) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.generation += 1;
+        inner.layouts = layout_count(&text);
+        inner.groups = if inner.layouts >= 2 {
+            active::group_names(&text, inner.layouts).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        inner.text = Some(text);
+        inner.active = None;
+    }
+
+    /// The layout in use, as read for the keymap of `generation`; dropped if
+    /// a newer keymap has arrived since.
+    fn set_active(&self, generation: u64, active: Option<active::ActiveLayout>) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation == generation {
+            inner.active = active;
+        }
+    }
+
+    /// The keymap's version, its number of layouts and their names, without
+    /// its text.
+    fn generation_and_groups(&self) -> (u64, u32, Vec<String>) {
+        let inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (inner.generation, inner.layouts, inner.groups.clone())
+    }
+
+    fn snapshot(&self) -> (u64, Option<String>, Option<active::ActiveLayout>) {
+        let inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (inner.generation, inner.text.clone(), inner.active)
+    }
+
+    fn downgrade(&self) -> Weak<Mutex<Inner>> {
+        Arc::downgrade(&self.0)
+    }
+
+    fn upgrade(weak: &Weak<Mutex<Inner>>) -> Option<Self> {
+        weak.upgrade().map(Self)
     }
 }
 
@@ -135,7 +216,7 @@ impl Input {
             InputCmd::SetKeymap(_) => self.port.lock_state().ok().map(|(_, num)| num),
             _ => None,
         };
-        let (generation, server) = self.server.snapshot();
+        let (generation, server, active) = self.server.snapshot();
         let mut state = self
             .state
             .lock()
@@ -145,7 +226,7 @@ impl Input {
         }
         // Releases for keys held under the old mode go out even if the
         // command itself fails.
-        let mut calls = state.set_server_keymap(generation, server);
+        let mut calls = state.update_server(generation, server, active);
         let translated = state.translate(cmd);
         drop(state);
         if let Ok(more) = &translated {
@@ -172,5 +253,49 @@ impl Drop for Input {
     /// Do not leave a key or button held when the input goes away.
     fn drop(&mut self) {
         let _ = self.send(InputCmd::ReleaseAll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xkbcommon::xkb;
+
+    fn layout(name: &str) -> String {
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        xkb::Keymap::new_from_names(&ctx, "", "", name, "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
+            .expect("compile")
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+    }
+
+    #[test]
+    fn the_layout_in_use_belongs_to_the_keymap_it_was_read_for() {
+        let keymap = ServerKeymap::fixed(&layout("us,de"));
+        let (generation, layouts, groups) = keymap.generation_and_groups();
+        assert_eq!(layouts, 2);
+        assert_eq!(groups, ["us", "de"]);
+        let group_1 = Some(active::ActiveLayout { group: 1, of: 2 });
+        keymap.set_active(generation, group_1);
+        assert_eq!(keymap.active_layout(), Some((1, 2)));
+        // A new keymap (the groups may have moved) clears it, and a result
+        // read for the old one is not taken.
+        keymap.set(layout("de,us"));
+        assert_eq!(keymap.active_layout(), None);
+        keymap.set_active(generation, group_1);
+        assert_eq!(keymap.active_layout(), None);
+        let (generation, _, groups) = keymap.generation_and_groups();
+        assert_eq!(groups, ["de", "us"]);
+        keymap.set_active(generation, group_1);
+        assert_eq!(keymap.active_layout(), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_keymap_with_one_layout_has_no_layout_choice_to_follow() {
+        let keymap = ServerKeymap::fixed(&layout("us"));
+        assert_eq!(keymap.generation_and_groups(), (1, 1, Vec::new()));
+        assert_eq!(
+            ServerKeymap::unknown().generation_and_groups(),
+            (0, 0, Vec::new())
+        );
     }
 }

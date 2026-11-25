@@ -383,6 +383,7 @@ fn work(requests: Sender<Request>) -> bool {
     }
     ok("server layout", "read from the compositor");
     let server_text = server.text();
+    let in_use = server.clone();
     let input = Input::new(ses.input(), stream.path(), extent).with_server_keymap(server);
 
     // Give the window time to appear, then click into it.
@@ -451,8 +452,12 @@ fn work(requests: Sender<Request>) -> bool {
         })();
         let _ = input.send(InputCmd::ReleaseAll);
         if let (Ok(viewer), Some(server)) = (layout_text(s.layout), server_text.as_deref()) {
+            let active = match in_use.active_layout() {
+                Some((group, of)) => format!("layout {} of {} in use", group + 1, of),
+                None => "layout in use not known".to_owned(),
+            };
             println!(
-                "       {} keys go as {:?}; {}",
+                "       {} keys go as {:?} ({active}); {}",
                 s.layout,
                 input.key_mode(),
                 describe(&viewer, server)

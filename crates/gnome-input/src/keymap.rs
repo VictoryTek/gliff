@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, Result};
 use xkbcommon::xkb;
 
+use crate::active::ActiveLayout;
 use crate::translate::Call;
 
 const SHIFT_L: u32 = 0xffe1;
@@ -189,11 +190,16 @@ fn compile(text: &str) -> Option<xkb::Keymap> {
 
 impl ViewerKeys {
     /// `server` is the server's keymap text when known.
-    pub fn new(text: &str, num_lock: bool, server: Option<&str>) -> Result<Self> {
+    pub fn new(
+        text: &str,
+        num_lock: bool,
+        server: Option<&str>,
+        active: Option<ActiveLayout>,
+    ) -> Result<Self> {
         let keymap =
             compile(text).ok_or_else(|| anyhow!("cannot compile the viewer's keymap text"))?;
         let state = Self::fresh_state(&keymap, num_lock);
-        let mode = Self::mode_for(&keymap, server);
+        let mode = Self::mode_for(&keymap, server, active);
         Ok(Self {
             text: text.to_owned(),
             keymap,
@@ -215,24 +221,36 @@ impl ViewerKeys {
         self.mode
     }
 
-    fn mode_for(viewer: &xkb::Keymap, server: Option<&str>) -> Mode {
-        match server.and_then(compile) {
-            // Which of the server's layouts is active is not known here. The
-            // viewer's layout can only be trusted as the same when it is one
-            // of them (key codes, as before); when it is none of them, key
-            // codes are certainly wrong and symbols are right in any layout.
-            Some(server) if (0..server.num_layouts()).any(|g| same_layout(viewer, &server, g)) => {
-                Mode::Codes
-            }
-            Some(_) => Mode::Keysyms,
-            None => Mode::Codes,
+    fn mode_for(viewer: &xkb::Keymap, server: Option<&str>, active: Option<ActiveLayout>) -> Mode {
+        let Some(server) = server.and_then(compile) else {
+            return Mode::Codes;
+        };
+        // When the layout in use is known, the viewer's layout is trusted as
+        // the same only if it is that one: a viewer on the server's other
+        // layout then goes as keysyms (Mutter finds them in the layout in
+        // use) instead of as key codes read with the wrong layout.
+        let in_use = active
+            .filter(|a| a.of == server.num_layouts() && a.group < a.of)
+            .map(|a| a.group);
+        let same = match in_use {
+            Some(group) => same_layout(viewer, &server, group),
+            // Not known: the viewer's layout can only be trusted as the same
+            // when it is one of them (key codes, as before); when it is none
+            // of them, key codes are certainly wrong and symbols are right in
+            // any layout.
+            None => (0..server.num_layouts()).any(|g| same_layout(viewer, &server, g)),
+        };
+        if same {
+            Mode::Codes
+        } else {
+            Mode::Keysyms
         }
     }
 
-    /// The server's keymap is now `server`: keys held under the old mode are
-    /// let go if the mode changes.
-    pub fn set_server(&mut self, server: Option<&str>) -> Vec<Call> {
-        let mode = Self::mode_for(&self.keymap, server);
+    /// The server's keymap is now `server` with `active` in use: keys held
+    /// under the old mode are let go if the mode changes.
+    pub fn set_server(&mut self, server: Option<&str>, active: Option<ActiveLayout>) -> Vec<Call> {
+        let mode = Self::mode_for(&self.keymap, server, active);
         if mode == self.mode {
             return Vec::new();
         }
