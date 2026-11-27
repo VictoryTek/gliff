@@ -2,16 +2,18 @@
 # upstream's changes to ci.yml never conflict with it.
 #
 # Every push and pull request lints and tests the viewer. Pushing a tag
-# vexdesk-v<version> (for example vexdesk-v0.1.0) also builds vexdesk.exe and
+# win-v<version> (for example win-v0.1.0) also builds vexdesk.exe and
 # publishes it as a release, which scripts/winget-install.ps1 installs. These
 # tags and versions are the fork's own: they do not touch the version in
-# Cargo.toml or upstream's v* tags.
+# Cargo.toml or upstream's v* tags. The prefix must not start with "v":
+# upstream's release job in ci.yml runs for every tag matching v* and fails on
+# a tag that is not its version.
 name: Windows viewer
 
 on:
   push:
     branches: [main]
-    tags: ["vexdesk-v*"]
+    tags: ["win-v*"]
   pull_request:
 
 permissions:
@@ -46,7 +48,7 @@ jobs:
       - name: Publish the viewer
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^vexdesk-v', ''
+          $version = $env:GITHUB_REF_NAME -replace '^win-v', ''
           $zip = "vexdesk-$version-x86_64-windows.zip"
           Compress-Archive -Path target\release\vexdesk.exe, LICENSE -DestinationPath $zip
           gh release create $env:GITHUB_REF_NAME $zip --title "VexDesk $version" --generate-notes

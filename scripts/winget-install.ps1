@@ -3,7 +3,7 @@
   Install or upgrade the gliff Windows viewer with winget, from a GitHub release.
 
 .DESCRIPTION
-  Downloads vexdesk-<version>-x86_64-windows.zip from the repo's vexdesk-v<version> release,
+  Downloads vexdesk-<version>-x86_64-windows.zip from the repo's win-v<version> release,
   writes a winget manifest for it (a portable app, command: vexdesk) and
   runs `winget install --manifest`. Run it again with a newer -Version to upgrade.
 
@@ -34,17 +34,17 @@ if (-not $Version -and $ZipFile) {
     Write-Error "-ZipFile needs -Version"
 }
 if (-not $Version) {
-    # The fork's viewer releases are tagged vexdesk-v<version>; its other releases
+    # The fork's viewer releases are tagged win-v<version>; its other releases
     # (upstream-style v* tags) are not ours to install.
     $releases = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=30"
-    $latest = $releases | Where-Object { $_.tag_name -like 'vexdesk-v*' -and -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
+    $latest = $releases | Where-Object { $_.tag_name -like 'win-v*' -and -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
     if (-not $latest) {
-        Write-Error "no vexdesk-v* release in $Repo yet"
+        Write-Error "no win-v* release in $Repo yet"
     }
-    $Version = $latest.tag_name -replace '^vexdesk-v', ''
+    $Version = $latest.tag_name -replace '^win-v', ''
 }
 $zipName = "vexdesk-$Version-x86_64-windows.zip"
-$url = "https://github.com/$Repo/releases/download/vexdesk-v$Version/$zipName"
+$url = "https://github.com/$Repo/releases/download/win-v$Version/$zipName"
 
 $work = Join-Path ([IO.Path]::GetTempPath()) "vexdesk-winget-$Version"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
