@@ -17,6 +17,7 @@ members = [
     "crates/gliff-vk",
     "crates/gliff-sw",
     "crates/gliff",
+    "crates/gliff-win",
     "crates/gliff-server",
     "crates/gliff-probe",
 ]

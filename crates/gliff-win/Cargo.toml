@@ -1,0 +1,30 @@
+[package]
+name = "gliff-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native Windows viewer for gliff: a winit window over the portable protocol and the CPU decoder"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+gliff-sw.workspace = true
+winit = "0.30"
+softbuffer = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
