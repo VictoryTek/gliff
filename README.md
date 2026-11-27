@@ -64,6 +64,29 @@ This uses the current checkout, including fixes newer than the last release.
 
 To build from source, see [docs/development.md](docs/development.md).
 
+### Windows viewer
+
+`gliff-win` is a native Windows viewer for a `gliff-server` remote (tested
+against GNOME):
+video, mouse, keyboard, text clipboard and cursor. Super and Alt+Tab go to the
+remote; Shift+Esc gives the keyboard back to Windows and a click takes it
+again. It needs the Windows OpenSSH client (built into Windows 10 and 11), and
+ssh prompts for a password in the same console window, so run it from a
+terminal.
+
+Each release carries `gliff-win-<version>-x86_64-windows.zip`. To install and
+upgrade it with winget, run this in the checkout, in PowerShell:
+
+```
+winget settings --enable LocalManifestFiles    # once, in an elevated terminal
+.\scripts\winget-install.ps1                   # the latest release; run again to upgrade
+gliff-win user@host
+```
+
+Or build it from source: `cargo run --release -p gliff-win -- user@host`.
+Not yet in the Windows viewer: files and images in the clipboard, non-US
+keyboard layouts, reconnecting.
+
 ## Use
 
 ```
