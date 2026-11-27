@@ -5,6 +5,7 @@
 //! 4:2:0 H.264 stream decoded on the CPU.
 
 mod clip;
+mod cursor;
 mod grab;
 mod keys;
 mod net;
@@ -20,14 +21,14 @@ use clap::Parser;
 use gliff_proto::{Axis, ClientMsg};
 use gliff_transport::SshTarget;
 use grab::Grab;
-use net::{Geometry, Slot, Ui, UiEvent};
+use net::{CursorSlot, Geometry, Slot, Ui, UiEvent};
 use tokio::sync::mpsc::UnboundedSender;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 /// A scroll wheel notch is this many logical pixels, as in the GTK viewer.
 const LINE_PX: f64 = 15.0;
@@ -70,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     // winit's raw keyboard registration makes Windows skip the shortcut hook
     // while the window has focus, and the viewer has no use for device events.
     event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
-    let (ui, slot, notified) = Ui::new(event_loop.create_proxy());
+    let (ui, slot, notified, cursor_slot) = Ui::new(event_loop.create_proxy());
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     let grab = {
         let proxy = event_loop.create_proxy();
@@ -94,6 +95,8 @@ fn main() -> anyhow::Result<()> {
         host: cli.host,
         slot,
         notified,
+        cursor_slot,
+        headless: false,
         input: Some(input_tx),
         window: None,
         surface: None,
@@ -126,6 +129,11 @@ struct App {
     host: String,
     slot: Slot,
     notified: Arc<AtomicBool>,
+    /// The remote's newest cursor shape the window has not taken yet.
+    cursor_slot: CursorSlot,
+    /// The session's video already draws the remote cursor, so the window
+    /// shows none of its own unless the server sends a usable shape.
+    headless: bool,
     /// Closed (taken) when the window goes, which ends the session.
     input: Option<UnboundedSender<ClientMsg>>,
     window: Option<Arc<Window>>,
@@ -198,6 +206,28 @@ impl App {
         }
         window.pre_present_notify();
         let _ = buf.present();
+    }
+
+    /// Show the remote's cursor over the window. A shape that cannot be shown
+    /// gives the ordinary arrow, or no cursor when the video carries it.
+    fn show_cursor(&self, event_loop: &ActiveEventLoop, shape: &cursor::CursorShape) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        let custom = cursor::to_rgba(shape).and_then(|c| {
+            CustomCursor::from_rgba(c.pixels, c.width, c.height, c.hot_x, c.hot_y).ok()
+        });
+        match custom {
+            Some(source) => {
+                w.set_cursor(event_loop.create_custom_cursor(source));
+                w.set_cursor_visible(true);
+            }
+            None if self.headless => w.set_cursor_visible(false),
+            None => {
+                w.set_cursor(CursorIcon::Default);
+                w.set_cursor_visible(true);
+            }
+        }
     }
 
     /// Start grabbing the keyboard if the session is up, the user has not
@@ -291,7 +321,18 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
             }
+            UiEvent::Cursor => {
+                let shape = self
+                    .cursor_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(shape) = shape {
+                    self.show_cursor(event_loop, &shape);
+                }
+            }
             UiEvent::Connected { headless } => {
+                self.headless = headless;
                 tracing::info!(headless, "session up");
                 // Tell the server the window's size, as the GTK viewer does.
                 self.last_resize = None;

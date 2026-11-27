@@ -22,6 +22,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use winit::event_loop::EventLoopProxy;
 
 use crate::clip::{Bridge, FromWin, WinTx};
+use crate::cursor::{payload_fits, CursorShape};
 
 /// What the window may be asked to decode: the largest stream we advertise.
 const MAX_STREAM: (u32, u32) = (3840, 2160);
@@ -52,9 +53,14 @@ pub struct Picture {
 /// queues them.
 pub type Slot = Arc<Mutex<Option<Picture>>>;
 
+/// The newest cursor shape not yet taken: a newer one replaces it.
+pub type CursorSlot = Arc<Mutex<Option<CursorShape>>>;
+
 pub enum UiEvent {
     /// A new picture waits in the slot.
     Frame,
+    /// A new cursor shape waits in the cursor slot.
+    Cursor,
     Connected {
         headless: bool,
     },
@@ -72,18 +78,35 @@ pub struct Ui {
     /// Set while a `UiEvent::Frame` is on its way, so a fast stream cannot
     /// flood the event loop.
     notified: Arc<AtomicBool>,
+    cursor: CursorSlot,
 }
 
 impl Ui {
-    pub fn new(proxy: EventLoopProxy<UiEvent>) -> (Self, Slot, Arc<AtomicBool>) {
+    pub fn new(proxy: EventLoopProxy<UiEvent>) -> (Self, Slot, Arc<AtomicBool>, CursorSlot) {
         let slot = Slot::default();
         let notified = Arc::new(AtomicBool::new(false));
+        let cursor = CursorSlot::default();
         let ui = Self {
             proxy,
             slot: slot.clone(),
             notified: notified.clone(),
+            cursor: cursor.clone(),
         };
-        (ui, slot, notified)
+        (ui, slot, notified, cursor)
+    }
+
+    /// Hand a cursor shape to the window. Only the first shape after the
+    /// window last took one sends a notice, so a burst queues nothing.
+    fn publish_cursor(&self, shape: CursorShape) {
+        let first = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(shape)
+            .is_none();
+        if first {
+            let _ = self.proxy.send_event(UiEvent::Cursor);
+        }
     }
 
     fn publish(&self, picture: Picture) {
@@ -420,10 +443,32 @@ where
                 }
                 bail!("server error {code}: {message}");
             }
+            ServerMsg::CursorShape {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb_len,
+                ..
+            } => {
+                // A payload that is not exactly the pixels is skipped by the
+                // next read and shown as "no usable shape".
+                let bgra = if payload_fits(width, height, argb_len) {
+                    reader.read_payload(argb_len).await?.to_vec()
+                } else {
+                    Vec::new()
+                };
+                ui.publish_cursor(CursorShape {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    bgra,
+                });
+            }
             other => {
-                // Clipboard messages go to the bridge; cursor messages are
-                // not handled yet and their payloads are skipped by the next
-                // read.
+                // Clipboard messages go to the bridge; the cursor position
+                // is not needed (the window's own pointer is the cursor).
                 if let Ok(clip_msg) = other.into_clipboard() {
                     let payload = match &clip_msg {
                         gliff_proto::ClipboardMsg::Data { data_len, .. } => {
