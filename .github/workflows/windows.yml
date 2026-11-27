@@ -1,8 +1,8 @@
-# The Windows viewer (crates/gliff-win), kept in a file of its own so that
+# The Windows viewer (crates/vexdesk), kept in a file of its own so that
 # upstream's changes to ci.yml never conflict with it.
 #
 # Every push and pull request lints and tests the viewer. Pushing a tag
-# win-v<version> (for example win-v0.1.0) also builds gliff-win.exe and
+# vexdesk-v<version> (for example vexdesk-v0.1.0) also builds vexdesk.exe and
 # publishes it as a release, which scripts/winget-install.ps1 installs. These
 # tags and versions are the fork's own: they do not touch the version in
 # Cargo.toml or upstream's v* tags.
@@ -11,7 +11,7 @@ name: Windows viewer
 on:
   push:
     branches: [main]
-    tags: ["win-v*"]
+    tags: ["vexdesk-v*"]
   pull_request:
 
 permissions:
@@ -28,8 +28,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo clippy -p gliff-win --all-targets --locked -- -D warnings
-      - run: cargo test -p gliff-proto -p gliff-transport -p gliff-sw -p gliff-win --locked
+      - run: cargo clippy -p vexdesk --all-targets --locked -- -D warnings
+      - run: cargo test -p gliff-proto -p gliff-transport -p gliff-sw -p vexdesk --locked
 
   release:
     needs: windows
@@ -42,11 +42,11 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
-      - run: cargo build --release -p gliff-win --locked
+      - run: cargo build --release -p vexdesk --locked
       - name: Publish the viewer
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^win-v', ''
-          $zip = "gliff-win-$version-x86_64-windows.zip"
-          Compress-Archive -Path target\release\gliff-win.exe, LICENSE -DestinationPath $zip
-          gh release create $env:GITHUB_REF_NAME $zip --title "gliff-win $version" --generate-notes
+          $version = $env:GITHUB_REF_NAME -replace '^vexdesk-v', ''
+          $zip = "vexdesk-$version-x86_64-windows.zip"
+          Compress-Archive -Path target\release\vexdesk.exe, LICENSE -DestinationPath $zip
+          gh release create $env:GITHUB_REF_NAME $zip --title "VexDesk $version" --generate-notes

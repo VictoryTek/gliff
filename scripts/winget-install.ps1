@@ -3,8 +3,8 @@
   Install or upgrade the gliff Windows viewer with winget, from a GitHub release.
 
 .DESCRIPTION
-  Downloads gliff-win-<version>-x86_64-windows.zip from the repo's win-v<version> release,
-  writes a winget manifest for it (a portable app, command: gliff-win) and
+  Downloads vexdesk-<version>-x86_64-windows.zip from the repo's vexdesk-v<version> release,
+  writes a winget manifest for it (a portable app, command: vexdesk) and
   runs `winget install --manifest`. Run it again with a newer -Version to upgrade.
 
   winget only installs from a local manifest after this is run once in an
@@ -16,7 +16,7 @@
 #>
 param(
     [string]$Version,
-    [string]$Repo = 'VictoryTek/gliff',
+    [string]$Repo = 'VictoryTek/vexdesk',
     # Hash this local zip instead of downloading the release's (for testing;
     # the manifest still names the release URL).
     [string]$ZipFile,
@@ -34,19 +34,19 @@ if (-not $Version -and $ZipFile) {
     Write-Error "-ZipFile needs -Version"
 }
 if (-not $Version) {
-    # The fork's viewer releases are tagged win-v<version>; its other releases
+    # The fork's viewer releases are tagged vexdesk-v<version>; its other releases
     # (upstream-style v* tags) are not ours to install.
     $releases = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=30"
-    $latest = $releases | Where-Object { $_.tag_name -like 'win-v*' -and -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
+    $latest = $releases | Where-Object { $_.tag_name -like 'vexdesk-v*' -and -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
     if (-not $latest) {
-        Write-Error "no win-v* release in $Repo yet"
+        Write-Error "no vexdesk-v* release in $Repo yet"
     }
-    $Version = $latest.tag_name -replace '^win-v', ''
+    $Version = $latest.tag_name -replace '^vexdesk-v', ''
 }
-$zipName = "gliff-win-$Version-x86_64-windows.zip"
-$url = "https://github.com/$Repo/releases/download/win-v$Version/$zipName"
+$zipName = "vexdesk-$Version-x86_64-windows.zip"
+$url = "https://github.com/$Repo/releases/download/vexdesk-v$Version/$zipName"
 
-$work = Join-Path ([IO.Path]::GetTempPath()) "gliff-winget-$Version"
+$work = Join-Path ([IO.Path]::GetTempPath()) "vexdesk-winget-$Version"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null
 
@@ -59,7 +59,7 @@ if ($ZipFile) {
 }
 $sha = (Get-FileHash $zip -Algorithm SHA256).Hash
 
-$id = 'VictoryTek.GliffWin'
+$id = 'VictoryTek.VexDesk'
 $schema = '1.6.0'
 Set-Content (Join-Path $work "$id.yaml") -Encoding utf8 @"
 PackageIdentifier: $id
@@ -73,10 +73,10 @@ PackageIdentifier: $id
 PackageVersion: $Version
 PackageLocale: en-US
 Publisher: VictoryTek
-PackageName: gliff-win
-ShortDescription: Native Windows viewer for gliff remote desktops
+PackageName: VexDesk
+ShortDescription: Native Windows viewer for gliff-server remote desktops
 License: MIT
-Moniker: gliff-win
+Moniker: vexdesk
 ManifestType: defaultLocale
 ManifestVersion: $schema
 "@
@@ -86,8 +86,8 @@ PackageVersion: $Version
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-- RelativeFilePath: gliff-win.exe
-  PortableCommandAlias: gliff-win
+- RelativeFilePath: vexdesk.exe
+  PortableCommandAlias: vexdesk
 Installers:
 - Architecture: x64
   InstallerUrl: $url
@@ -103,4 +103,4 @@ if ($ManifestOnly) {
 }
 winget install --manifest $work --accept-source-agreements
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Installed. Open a new terminal and run: gliff-win user@host"
+Write-Host "Installed. Open a new terminal and run: vexdesk user@host"

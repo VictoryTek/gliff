@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gliff_win=info".into()),
+                .unwrap_or_else(|_| "vexdesk=info".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -240,9 +240,9 @@ impl App {
 
     fn title(&self) -> String {
         if self.released {
-            format!("gliff - {} (keys released, click to capture)", self.host)
+            format!("VexDesk - {} (keys released, click to capture)", self.host)
         } else {
-            format!("gliff - {}", self.host)
+            format!("VexDesk - {}", self.host)
         }
     }
 

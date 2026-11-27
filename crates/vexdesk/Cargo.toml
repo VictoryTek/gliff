@@ -1,5 +1,5 @@
 [package]
-name = "gliff-win"
+name = "vexdesk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

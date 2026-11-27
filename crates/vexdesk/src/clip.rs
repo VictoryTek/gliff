@@ -379,7 +379,7 @@ mod win {
         wake: Arc<AtomicIsize>,
     ) -> Option<std::thread::JoinHandle<()>> {
         let started = std::thread::Builder::new()
-            .name("gliff-clipboard".into())
+            .name("vexdesk-clipboard".into())
             .spawn(move || run(rx, events, wake));
         match started {
             Ok(t) => Some(t),
@@ -391,7 +391,7 @@ mod win {
     }
 
     fn run(rx: Receiver<ToWin>, events: UnboundedSender<FromWin>, wake: Arc<AtomicIsize>) {
-        let class = wide("gliff-clipboard");
+        let class = wide("vexdesk-clipboard");
         // SAFETY: plain Win32 calls with valid arguments: `class` outlives
         // them, the window procedure is a function of this module, and `msg`
         // is a C struct that GetMessageW fills in.

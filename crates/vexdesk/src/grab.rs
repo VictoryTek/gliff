@@ -235,7 +235,7 @@ mod hook {
     /// the whole system's typing, so it is not the window thread.
     pub fn spawn() {
         let started = std::thread::Builder::new()
-            .name("gliff-keyhook".into())
+            .name("vexdesk-keyhook".into())
             .spawn(run);
         if let Err(e) = started {
             tracing::warn!(error = %e, "cannot start the keyboard hook thread; shortcuts stay local");

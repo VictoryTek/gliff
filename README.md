@@ -1,12 +1,19 @@
-# gliff
+# VexDesk
 
-[![CI](https://github.com/omacom/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/omacom/gliff/actions/workflows/ci.yml)
+[![CI](https://github.com/VictoryTek/vexdesk/actions/workflows/ci.yml/badge.svg)](https://github.com/VictoryTek/vexdesk/actions/workflows/ci.yml)
+
+VexDesk is a fork of [gliff](https://github.com/omacom/gliff) by Kevin
+McConnell. It adds a GNOME (Mutter) backend for the remote machine and a
+native Windows viewer, `vexdesk`. Everything else is gliff, and this fork
+keeps merging gliff's changes: the internal crates and the `gliff` and
+`gliff-server` programs keep their names so that those merges stay clean, and
+the rest of this README still says gliff for them.
 
 gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
 ssh: no open ports, no accounts, no relay.
 
-> **This fork is adding GNOME support.** The remote machine can also run a
+> **GNOME support is in this fork.** The remote machine can also run a
 > GNOME (Mutter) session, not only Hyprland. It is work in progress; see
 > [docs/gnome-backend.md](docs/gnome-backend.md) for what works so far.
 
@@ -66,7 +73,7 @@ To build from source, see [docs/development.md](docs/development.md).
 
 ### Windows viewer
 
-`gliff-win` is a native Windows viewer for a `gliff-server` remote (tested
+`vexdesk` is a native Windows viewer for a `gliff-server` remote (tested
 against GNOME):
 video, mouse, keyboard, text clipboard and cursor. Super and Alt+Tab go to the
 remote; Shift+Esc gives the keyboard back to Windows and a click takes it
@@ -74,18 +81,18 @@ again. It needs the Windows OpenSSH client (built into Windows 10 and 11), and
 ssh prompts for a password in the same console window, so run it from a
 terminal.
 
-Pushing a tag `win-v<version>` (say `win-v0.1.0`) builds and publishes
-`gliff-win-<version>-x86_64-windows.zip`. These tags are the viewer's own and
+Pushing a tag `vexdesk-v<version>` (say `vexdesk-v0.1.0`) builds and
+publishes `vexdesk-<version>-x86_64-windows.zip`. These tags are the viewer's own and
 leave `Cargo.toml` and upstream's `v*` tags alone. To install and upgrade it
 with winget, run this in the checkout, in PowerShell:
 
 ```
 winget settings --enable LocalManifestFiles    # once, in an elevated terminal
 .\scripts\winget-install.ps1                   # the latest release; run again to upgrade
-gliff-win user@host
+vexdesk user@host
 ```
 
-Or build it from source: `cargo run --release -p gliff-win -- user@host`.
+Or build it from source: `cargo run --release -p vexdesk -- user@host`.
 Not yet in the Windows viewer: files and images in the clipboard, non-US
 keyboard layouts, reconnecting.
 

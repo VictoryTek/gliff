@@ -136,7 +136,7 @@ pub fn spawn(
     clip: ClipLink,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
-        .name("gliff-net".into())
+        .name("vexdesk-net".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
