@@ -4,6 +4,7 @@
 //! Run it from a terminal: ssh asks for a password there. Video is one
 //! 4:2:0 H.264 stream decoded on the CPU.
 
+mod clip;
 mod grab;
 mod keys;
 mod net;
@@ -77,7 +78,17 @@ fn main() -> anyhow::Result<()> {
             let _ = proxy.send_event(UiEvent::GrabReleased);
         })
     };
-    let worker = net::spawn(target, ui, input_rx)?;
+    let (clip_events_tx, clip_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let clip = clip::start(clip_events_tx);
+    let worker = net::spawn(
+        target,
+        ui,
+        input_rx,
+        net::ClipLink {
+            events: clip_events_rx,
+            win: clip.win.clone(),
+        },
+    )?;
 
     let mut app = App {
         host: cli.host,
@@ -102,6 +113,7 @@ fn main() -> anyhow::Result<()> {
     // The hook holds a sender of its own, which would keep the session open.
     app.grab.close();
     let _ = worker.join();
+    clip.shutdown();
     match app.failure {
         Some(reason) => anyhow::bail!(reason),
         None => Ok(()),

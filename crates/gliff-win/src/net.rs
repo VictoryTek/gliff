@@ -9,15 +9,19 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, Codec,
     ServerMsg, PROTOCOL_VERSION,
 };
 use gliff_sw::{BgraFrame, Decoder};
+use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use winit::event_loop::EventLoopProxy;
+
+use crate::clip::{Bridge, FromWin, WinTx};
 
 /// What the window may be asked to decode: the largest stream we advertise.
 const MAX_STREAM: (u32, u32) = (3840, 2160);
@@ -94,12 +98,19 @@ impl Ui {
     }
 }
 
+/// The session's two ends of the clipboard thread.
+pub struct ClipLink {
+    pub events: UnboundedReceiver<FromWin>,
+    pub win: WinTx,
+}
+
 /// Run the worker on its own thread. It ends when the connection does, or
 /// when `input` is closed.
 pub fn spawn(
     target: SshTarget,
     ui: Ui,
     input: UnboundedReceiver<ClientMsg>,
+    clip: ClipLink,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("gliff-net".into())
@@ -114,13 +125,15 @@ pub fn spawn(
                     return;
                 }
             };
-            let result = rt.block_on(async {
+            // The clipboard engine runs its tasks on this thread.
+            let local = tokio::task::LocalSet::new();
+            let result = rt.block_on(local.run_until(async {
                 let ssh = spawn_ssh(&target).context("cannot run ssh")?;
                 // `ssh.child` stays alive until the session ends; dropping it
                 // kills ssh.
                 let _child = ssh.child;
-                session(ssh.stdout, ssh.stdin, &ui, input).await
-            });
+                session(ssh.stdout, ssh.stdin, &ui, input, clip).await
+            }));
             ui.send(UiEvent::Closed(result.err().map(|e| format!("{e:#}"))));
         })
 }
@@ -161,7 +174,13 @@ impl Config {
     }
 }
 
-async fn session<R, W>(rd: R, wr: W, ui: &Ui, mut input: UnboundedReceiver<ClientMsg>) -> Result<()>
+async fn session<R, W>(
+    rd: R,
+    wr: W,
+    ui: &Ui,
+    mut input: UnboundedReceiver<ClientMsg>,
+    mut clip: ClipLink,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -235,13 +254,35 @@ where
     ui.send(UiEvent::Connected { headless });
 
     // Writes run on their own task so reading never waits on a write.
-    let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
+    let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
     let mut writes = tokio::spawn(async move {
-        while let Some(m) = out_rx.recv().await {
-            writer.write_msg(&m).await?;
+        while let Some((m, payload)) = out_rx.recv().await {
+            if payload.is_empty() {
+                writer.write_msg(&m).await?;
+            } else {
+                writer.write_msg_with_payloads(&m, &[&payload]).await?;
+            }
         }
         Ok::<(), gliff_transport::Error>(())
     });
+    // Clipboard transfers write through the same channel, in chunks.
+    let (clip_out_tx, mut clip_out_rx) = outbound_channel();
+    let bridge = Bridge::new(Transfers::new(clip_out_tx, Side::Client), clip.win.clone());
+    {
+        let out_tx = out_tx.clone();
+        tokio::task::spawn_local(async move {
+            while let Some((m, payload)) = clip_out_rx.recv().await {
+                if out_tx.send((ClientMsg::from(m), payload)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // Whatever changed on the clipboard before the session was up is stale:
+    // ask for its state as it is now.
+    while clip.events.try_recv().is_ok() {}
+    bridge.resync();
+    let mut clip_open = true;
     // The window's input joins the same channel. When the window closes its
     // end, the session is over.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
@@ -249,7 +290,7 @@ where
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
             while let Some(m) = input.recv().await {
-                if out_tx.send(m).is_err() {
+                if out_tx.send((m, Bytes::new())).is_err() {
                     return;
                 }
             }
@@ -283,6 +324,13 @@ where
                 written.context("writer task")?.context("write to server")?;
                 return Ok(());
             }
+            event = clip.events.recv(), if clip_open => {
+                match event {
+                    Some(event) => bridge.on_win(event),
+                    None => clip_open = false,
+                }
+                continue;
+            }
             _ = tokio::time::sleep_until(drain_at), if decoder.has_pending() => {
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
                 match decoder.flush() {
@@ -294,7 +342,7 @@ where
                     Err(e) => {
                         in_decoder.clear();
                         tracing::warn!(error = %e, "idle drain failed; requesting keyframe");
-                        let _ = out_tx.send(ClientMsg::RequestKeyframe);
+                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
                     }
                 }
                 continue;
@@ -322,10 +370,13 @@ where
                 in_decoder.push_back(cfg.geometry);
                 let decoded = decoder.decode(&main, &aux);
                 // Ack at once so the server keeps pacing.
-                let _ = out_tx.send(ClientMsg::FrameAck {
-                    frame_id,
-                    decoded_at_ms: now_ms(),
-                });
+                let _ = out_tx.send((
+                    ClientMsg::FrameAck {
+                        frame_id,
+                        decoded_at_ms: now_ms(),
+                    },
+                    Bytes::new(),
+                ));
                 match decoded {
                     Ok(Some(frame)) => {
                         let geometry = in_decoder.pop_front().unwrap_or(cfg.geometry);
@@ -335,7 +386,7 @@ where
                     Err(e) => {
                         in_decoder.clear();
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
-                        let _ = out_tx.send(ClientMsg::RequestKeyframe);
+                        let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
                     }
                 }
             }
@@ -361,7 +412,7 @@ where
                 cfg = next;
             }
             ServerMsg::Ping { t } => {
-                let _ = out_tx.send(ClientMsg::Pong { t });
+                let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::Error { code, message, .. } => {
                 if is_incompatible(code) {
@@ -369,9 +420,23 @@ where
                 }
                 bail!("server error {code}: {message}");
             }
-            // Cursor and clipboard messages are not handled yet; their
-            // payloads are skipped by the next read.
-            _ => {}
+            other => {
+                // Clipboard messages go to the bridge; cursor messages are
+                // not handled yet and their payloads are skipped by the next
+                // read.
+                if let Ok(clip_msg) = other.into_clipboard() {
+                    let payload = match &clip_msg {
+                        gliff_proto::ClipboardMsg::Data { data_len, .. } => {
+                            if *data_len as usize > CHUNK {
+                                bail!("clipboard chunk of {data_len} bytes exceeds the limit");
+                            }
+                            reader.read_payload(*data_len).await?
+                        }
+                        _ => Bytes::new(),
+                    };
+                    bridge.on_peer(clip_msg, payload);
+                }
+            }
         }
     }
 }
