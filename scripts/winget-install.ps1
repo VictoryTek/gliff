@@ -3,7 +3,7 @@
   Install or upgrade the gliff Windows viewer with winget, from a GitHub release.
 
 .DESCRIPTION
-  Downloads gliff-win-<version>-x86_64-windows.zip from the repo's release,
+  Downloads gliff-win-<version>-x86_64-windows.zip from the repo's win-v<version> release,
   writes a winget manifest for it (a portable app, command: gliff-win) and
   runs `winget install --manifest`. Run it again with a newer -Version to upgrade.
 
@@ -12,7 +12,7 @@
 
 .EXAMPLE
   .\scripts\winget-install.ps1              # the latest release
-  .\scripts\winget-install.ps1 -Version 0.4.4
+  .\scripts\winget-install.ps1 -Version 0.1.0
 #>
 param(
     [string]$Version,
@@ -34,11 +34,17 @@ if (-not $Version -and $ZipFile) {
     Write-Error "-ZipFile needs -Version"
 }
 if (-not $Version) {
-    $latest = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
-    $Version = $latest.tag_name.TrimStart('v')
+    # The fork's viewer releases are tagged win-v<version>; its other releases
+    # (upstream-style v* tags) are not ours to install.
+    $releases = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=30"
+    $latest = $releases | Where-Object { $_.tag_name -like 'win-v*' -and -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
+    if (-not $latest) {
+        Write-Error "no win-v* release in $Repo yet"
+    }
+    $Version = $latest.tag_name -replace '^win-v', ''
 }
 $zipName = "gliff-win-$Version-x86_64-windows.zip"
-$url = "https://github.com/$Repo/releases/download/v$Version/$zipName"
+$url = "https://github.com/$Repo/releases/download/win-v$Version/$zipName"
 
 $work = Join-Path ([IO.Path]::GetTempPath()) "gliff-winget-$Version"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue

@@ -74,8 +74,10 @@ again. It needs the Windows OpenSSH client (built into Windows 10 and 11), and
 ssh prompts for a password in the same console window, so run it from a
 terminal.
 
-Each release carries `gliff-win-<version>-x86_64-windows.zip`. To install and
-upgrade it with winget, run this in the checkout, in PowerShell:
+Pushing a tag `win-v<version>` (say `win-v0.1.0`) builds and publishes
+`gliff-win-<version>-x86_64-windows.zip`. These tags are the viewer's own and
+leave `Cargo.toml` and upstream's `v*` tags alone. To install and upgrade it
+with winget, run this in the checkout, in PowerShell:
 
 ```
 winget settings --enable LocalManifestFiles    # once, in an elevated terminal
