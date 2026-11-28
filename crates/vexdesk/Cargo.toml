@@ -19,8 +19,12 @@ tracing-subscriber.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-sw.workspace = true
-winit = "0.30"
-softbuffer = "0.4"
+# X11 only on Linux. Their default `wayland-dlopen` would, through workspace
+# feature unification, switch every gliff crate's wayland-client to libwayland
+# opened with dlopen, which the Nix build sandbox (and a NixOS install) cannot
+# find. On Windows these features are no-ops.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen"] }
 
 # The layout table's test compiles each layout with real XKB data.
 [target.'cfg(unix)'.dev-dependencies]
