@@ -8,6 +8,7 @@ mod clip;
 mod cursor;
 mod grab;
 mod keys;
+mod layout;
 mod net;
 mod view;
 
@@ -23,6 +24,7 @@ use gliff_transport::SshTarget;
 use grab::Grab;
 use net::{CursorSlot, Geometry, Slot, Ui, UiEvent};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -34,6 +36,9 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 const LINE_PX: f64 = 15.0;
 /// A resize is sent once the window has stopped changing for this long.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+/// How often a focused window looks for a keyboard layout switch that came
+/// with no event of its own (keys under the grab go by the hook).
+const LAYOUT_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +86,7 @@ fn main() -> anyhow::Result<()> {
     };
     let (clip_events_tx, clip_events_rx) = tokio::sync::mpsc::unbounded_channel();
     let clip = clip::start(clip_events_tx);
+    let (layout_tx, layout_rx) = tokio::sync::watch::channel(layout::current());
     let worker = net::spawn(
         target,
         ui,
@@ -89,6 +95,7 @@ fn main() -> anyhow::Result<()> {
             events: clip_events_rx,
             win: clip.win.clone(),
         },
+        layout_rx,
     )?;
 
     let mut app = App {
@@ -109,6 +116,8 @@ fn main() -> anyhow::Result<()> {
         grab,
         released: false,
         connected: false,
+        notice: None,
+        layout: layout_tx,
     };
     event_loop.run_app(&mut app)?;
     // The window is gone: the worker sees its input close, says Bye and ends.
@@ -153,6 +162,10 @@ struct App {
     released: bool,
     /// The session is up, so keys have somewhere to go.
     connected: bool,
+    /// A line from the session for the user (an unknown keyboard layout).
+    notice: Option<String>,
+    /// The window's Windows keyboard layout, which the session follows.
+    layout: watch::Sender<String>,
 }
 
 impl App {
@@ -239,11 +252,15 @@ impl App {
     }
 
     fn title(&self) -> String {
+        let mut title = format!("VexDesk - {}", self.host);
         if self.released {
-            format!("VexDesk - {} (keys released, click to capture)", self.host)
-        } else {
-            format!("VexDesk - {}", self.host)
+            title.push_str(" (keys released, click to capture)");
         }
+        if let Some(notice) = &self.notice {
+            title.push_str(" - ");
+            title.push_str(notice);
+        }
+        title
     }
 
     fn update_title(&self) {
@@ -259,6 +276,19 @@ impl App {
                 pressed: false,
             });
         }
+    }
+
+    /// Tell the session if the Windows keyboard layout has changed. Windows
+    /// switches it on the window's thread, so it is read here.
+    fn follow_layout(&self) {
+        let now = layout::current();
+        self.layout.send_if_modified(|klid| {
+            let changed = *klid != now;
+            if changed {
+                *klid = now;
+            }
+            changed
+        });
     }
 
     fn request_resize(&mut self) {
@@ -342,6 +372,13 @@ impl ApplicationHandler<UiEvent> for App {
                 // session is up goes nowhere.
                 self.connected = true;
                 self.grab_if_ready();
+            }
+            UiEvent::Notice(notice) => {
+                if let Some(line) = &notice {
+                    tracing::warn!("{line}");
+                }
+                self.notice = notice;
+                self.update_title();
             }
             UiEvent::GrabReleased => {
                 self.released = true;
@@ -454,13 +491,15 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.resize_due {
-            Some(due) if Instant::now() >= due => {
-                self.resize_due = None;
-                self.request_resize();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            Some(due) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
+        self.follow_layout();
+        if self.resize_due.is_some_and(|due| Instant::now() >= due) {
+            self.resize_due = None;
+            self.request_resize();
+        }
+        let focused = self.window.as_ref().is_some_and(|w| w.has_focus());
+        let poll = focused.then(|| Instant::now() + LAYOUT_POLL);
+        match self.resize_due.into_iter().chain(poll).min() {
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
