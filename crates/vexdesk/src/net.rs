@@ -24,6 +24,9 @@ use winit::event_loop::EventLoopProxy;
 use crate::clip::{Bridge, FromWin, WinTx};
 use crate::cursor::{payload_fits, CursorShape};
 
+#[cfg(test)]
+mod fake;
+
 /// What the window may be asked to decode: the largest stream we advertise.
 const MAX_STREAM: (u32, u32) = (3840, 2160);
 /// The CPU decoder holds the first picture of a High-profile stream until
@@ -70,10 +73,32 @@ pub enum UiEvent {
     Closed(Option<String>),
 }
 
+/// Where the worker's events go: the window's event loop, or a test's channel.
+#[derive(Clone)]
+enum Sink {
+    Window(EventLoopProxy<UiEvent>),
+    #[cfg(test)]
+    Recorder(tokio::sync::mpsc::UnboundedSender<UiEvent>),
+}
+
+impl Sink {
+    fn send(&self, event: UiEvent) {
+        match self {
+            Sink::Window(proxy) => {
+                let _ = proxy.send_event(event);
+            }
+            #[cfg(test)]
+            Sink::Recorder(tx) => {
+                let _ = tx.send(event);
+            }
+        }
+    }
+}
+
 /// Everything the worker reports to the window.
 #[derive(Clone)]
 pub struct Ui {
-    proxy: EventLoopProxy<UiEvent>,
+    sink: Sink,
     slot: Slot,
     /// Set while a `UiEvent::Frame` is on its way, so a fast stream cannot
     /// flood the event loop.
@@ -83,11 +108,23 @@ pub struct Ui {
 
 impl Ui {
     pub fn new(proxy: EventLoopProxy<UiEvent>) -> (Self, Slot, Arc<AtomicBool>, CursorSlot) {
+        Self::with_sink(Sink::Window(proxy))
+    }
+
+    /// A `Ui` with no window: its events go to `events`.
+    #[cfg(test)]
+    fn recording(
+        events: tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    ) -> (Self, Slot, Arc<AtomicBool>, CursorSlot) {
+        Self::with_sink(Sink::Recorder(events))
+    }
+
+    fn with_sink(sink: Sink) -> (Self, Slot, Arc<AtomicBool>, CursorSlot) {
         let slot = Slot::default();
         let notified = Arc::new(AtomicBool::new(false));
         let cursor = CursorSlot::default();
         let ui = Self {
-            proxy,
+            sink,
             slot: slot.clone(),
             notified: notified.clone(),
             cursor: cursor.clone(),
@@ -105,19 +142,19 @@ impl Ui {
             .replace(shape)
             .is_none();
         if first {
-            let _ = self.proxy.send_event(UiEvent::Cursor);
+            self.sink.send(UiEvent::Cursor);
         }
     }
 
     fn publish(&self, picture: Picture) {
         *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(picture);
         if !self.notified.swap(true, Ordering::AcqRel) {
-            let _ = self.proxy.send_event(UiEvent::Frame);
+            self.sink.send(UiEvent::Frame);
         }
     }
 
     fn send(&self, event: UiEvent) {
-        let _ = self.proxy.send_event(event);
+        self.sink.send(event);
     }
 }
 
@@ -497,6 +534,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clip::ToWin;
 
     #[test]
     fn a_stream_of_another_kind_is_refused() {
@@ -518,5 +556,118 @@ mod tests {
         let resized = Config::new((1280, 720), ChromaMode::Single420, 1000, (1280, 720)).unwrap();
         assert!(!a.recodes(&rescaled));
         assert!(a.recodes(&resized));
+    }
+
+    /// One keyframe of a flat grey picture, as gliff-server's CPU path
+    /// encodes it (Baseline, so the decoder returns it at once).
+    fn keyframe(width: u32, height: u32) -> Vec<u8> {
+        let settings = gliff_sw::EncoderSettings {
+            width,
+            height,
+            bitrate: 2_000_000,
+            framerate: 60,
+        };
+        let mut encoder = gliff_sw::Encoder::new(settings, false).expect("encoder");
+        let grey = vec![0x80u8; (width * height * 4) as usize];
+        encoder.encode_bgra(&grey, true).expect("encode").main
+    }
+
+    fn local<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(tokio::task::LocalSet::new().run_until(f))
+    }
+
+    #[test]
+    fn a_session_says_hello_and_shows_the_first_frame() {
+        local(async {
+            let (mut server, mut window, task) = fake::start();
+
+            let ClientMsg::Hello {
+                version,
+                keymap,
+                caps,
+            } = server.recv().await
+            else {
+                panic!("the session did not open with Hello");
+            };
+            assert_eq!(version, PROTOCOL_VERSION);
+            assert_eq!(keymap, "");
+            assert_eq!(caps.codecs, vec![Codec::H264]);
+            assert_eq!(caps.chroma, vec![ChromaMode::Single420]);
+            assert_eq!((caps.max_width, caps.max_height), (3840, 2160));
+
+            server.accept(320, 240).await;
+            assert!(matches!(
+                window.event().await,
+                UiEvent::Connected { headless: false }
+            ));
+            assert!(matches!(window.clipboard_request(), ToWin::Resync));
+
+            server.send_frame(1, true, &keyframe(320, 240)).await;
+            assert!(matches!(
+                server.recv().await,
+                ClientMsg::FrameAck { frame_id: 1, .. }
+            ));
+            assert!(matches!(window.event().await, UiEvent::Frame));
+            let picture = window.take_picture().expect("a picture in the slot");
+            assert_eq!((picture.bgra.width, picture.bgra.height), (320, 240));
+            assert_eq!(
+                picture.geometry,
+                Geometry {
+                    stream: (320, 240),
+                    view: (320, 240),
+                    scale_milli: 1000,
+                }
+            );
+
+            server.drop_stream();
+            fake::ended(task)
+                .await
+                .expect("a dropped stream ends cleanly");
+        });
+    }
+
+    #[test]
+    fn closing_the_window_sends_its_bye_and_ends_the_session() {
+        local(async {
+            let (mut server, mut window, task) = fake::start();
+            assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
+            server.accept(320, 240).await;
+            assert!(matches!(window.event().await, UiEvent::Connected { .. }));
+
+            window.input(ClientMsg::Bye);
+            window.close();
+            assert!(matches!(server.recv().await, ClientMsg::Bye));
+            fake::ended(task)
+                .await
+                .expect("closing the window ends cleanly");
+        });
+    }
+
+    #[test]
+    fn a_stream_dropped_mid_handshake_ends_the_session() {
+        local(async {
+            let (mut server, _window, task) = fake::start();
+            assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
+            server.send(fake::hello_ack(false)).await;
+            server.drop_stream();
+            assert!(fake::ended(task).await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_server_error_ends_the_session_with_its_message() {
+        local(async {
+            let (mut server, mut window, task) = fake::start();
+            assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
+            server.accept(320, 240).await;
+            assert!(matches!(window.event().await, UiEvent::Connected { .. }));
+            server.send(ServerMsg::error(7, "capture failed")).await;
+            let err = fake::ended(task).await.expect_err("an error");
+            assert!(format!("{err:#}").contains("capture failed"), "{err:#}");
+        });
     }
 }
