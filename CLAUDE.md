@@ -7,3 +7,17 @@ Hyprland session; the GPU cases need Vulkan compute and a VA-API H.264
 codec. Run it before merging changes to the video pipeline. See
 `docs/architecture.md` for the design and `docs/development.md` for the
 build and the testing tools.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues in `VictoryTek/vexdesk` (this fork) via `gh`; never file into upstream `omacom/gliff`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

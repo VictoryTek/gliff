@@ -146,6 +146,39 @@ Gate per step: a probe command (extend `gliff-probe`) proves the step on a real 
 - Step 0 result (2026-11-24, Windows 11, rustc host `x86_64-pc-windows-msvc`, no extra toolchain beyond what MSVC Rust needs): `cargo check` and `cargo test -p gliff-proto -p gliff-transport -p gliff-sw` pass except one test. `gliff-proto` 25 of 25, `gliff-sw` 21 of 21 (OpenH264 builds from source), `gliff-transport` 31 of 32. The failure, `clipboard::tests::files_are_listed_spooled_and_removed`, is a real bug for a Windows client: `files.rs` `walk` builds each wire path with `rel.join(entry.file_name())` and turns it into a string, which gives `photos\a.txt` on Windows, while the wire format and `safe_relative_path` use `/`. Fix it when the Windows clipboard is built (join the components with `/`); it was left alone because nothing runs this on Windows yet and the file is upstream's. One Windows-only warning: `let mut builder` in `files.rs` is unused outside `cfg(unix)`. The ssh child process, the window, input capture and the Win32 clipboard are untouched by this check.
 - Not covered: Windows as the machine being controlled. That would be a different server backend and is out of scope.
 
+**M7 plan: from a command-line viewer to an app (agreed 2026-11-27).** The Linux viewer is about 6,900 lines and `vexdesk` about 2,500, and `vexdesk` has to be started from a terminal. The steps below close that gap. The words used (Machine, Session, Mirror, Private screen) are in `GLOSSARY.md`; the two lasting decisions are `docs/adr/0001-windows-viewer-ui-in-egui-on-our-own-winit-loop.md` and `docs/adr/0002-windows-viewer-lives-in-fork-owned-files.md`.
+
+- **Rules for upstream-owned files.**
+  - New code goes only in fork-owned files: `crates/vexdesk/**`, `packaging/windows/` (the WiX source) and `.github/workflows/windows.yml`.
+  - An upstream-owned file changes only for a small portability fix in a crate both platforms share (`gliff-proto`, `gliff-transport`, `gliff-sw`). Each fix gets a row in the table under "Rule: keep upstream files in sync-able shape", and is logged there only. No upstream pull request is opened or drafted.
+  - No protocol changes. The keyboard layout goes as XKB text that names the layout, and passwords go through `SSH_ASKPASS`.
+  - Checked 2026-11-27: `main` already holds upstream's latest release (gliff 0.4.3, 2026-11-12), so nothing is waiting to merge. The only upstream code these steps are expected to touch is `crates/gliff-transport/src/clipboard/*` (step 5), which upstream changed a lot in September and October. `Cargo.lock` changes in every step and is regenerated, not merged by hand.
+- **UI toolkit: egui, inside our own winit loop** (`egui-winit` and `egui-wgpu`, not `eframe`). The shortcut grab must see Super and Alt+Tab first, and `eframe` owns the event loop. The video becomes a wgpu texture. The window code is rewritten; the video, input and clipboard code stays.
+- **Icon:** a placeholder VexDesk monogram, made as an SVG plus a multi-size `.ico` in `crates/vexdesk/assets/`, replaceable at any time. Nothing from upstream's `pkgbuild/gliff.svg` is used.
+- **Order and dependencies.** Keyboard and 4:4:4 need no UI and no other step, and are small and visible, so they come first. The shell comes next and everything with a UI waits for it: the installer needs the shell and the icon, reconnect needs the shell (for the "reconnecting" state and the password prompt), and the clipboard's progress bar and cancel need the shell. The clipboard transfers themselves have no dependency and run alongside.
+- **Each step goes through the Sol review, as in step 2.**
+
+1. **Keyboard layout.**
+   - Map the Windows layout to an XKB layout name and send `Hello.keymap` as short XKB text that names the layout (for example `pc+de`). The server's xkbcommon fills in the rest, so the protocol is unchanged.
+   - A Windows layout with no entry falls back to US, with one line saying so in the tab.
+   - Switching layout in a Session (Win+Space) sends the new one at once with the existing `Keymap` message.
+2. **4:4:4.** Offer `Dual420` first and `Single420` second in `ClientCaps.chroma`, and drop the check in `net.rs` that refuses anything but `Single420`. `gliff-sw`'s `Decoder::new(dual, ...)` already recombines the two streams. The server already adapts the stream to the link from the frame acks `vexdesk` sends, so the "adapts to the link" gap is expected to be false; check it on hardware. GPU decode on Windows (D3D11/DXVA) is deferred until the CPU cannot keep up at the resolution in use.
+3. **The shell.**
+   - No console window, and `vexdesk user@host` still works: it opens that Machine's tab and shows it. Logs go to `%LOCALAPPDATA%\VexDesk\vexdesk.log`; errors show in the tab.
+   - A start screen with an address bar. Tabs for every Machine; background tabs keep streaming; hovering a tab shows stop (a running Session) or forget (one that is not). Dragging tabs to reorder them waits.
+   - The Machines that were open when the window closed connect again at the next launch, and the one that was shown is shown again.
+   - Mirror (a named screen, or the default) or Private screen, set per Machine from the Machine's connection options. This is the screen-choice gap, which was not in the first list of steps.
+   - Passwords are asked for inside the app: `vexdesk` is its own `SSH_ASKPASS` helper (`SSH_ASKPASS_REQUIRE=force`) in the environment of the `ssh` it starts, so `gliff-transport/src/ssh.rs` stays upstream's. A typed password is kept in memory for that Session so a reconnect does not ask again. It is never written to disk or to Credential Manager, and is gone when the Session is stopped or the app closes.
+   - Settings live in `%APPDATA%\VexDesk\config.toml` with the Linux viewer's keys (`machines`, `open`, `shown`).
+   - Local clipboard changes are offered only to the Machine on screen, as upstream does since `98000f3`.
+   - Colours follow the system light or dark setting.
+4. **Installer.** Needs the shell and the icon.
+   - A per-user, unsigned MSI built with WiX in CI, installing to `%LOCALAPPDATA%\Programs\VexDesk`, with no admin prompt. It adds a Start menu shortcut, a desktop shortcut and an Apps & Features uninstall entry. Being unsigned, it shows the SmartScreen "unknown publisher" warning on first install.
+   - winget's portable type cannot make shortcuts, so winget installs the MSI from a manifest of type `wix`. `scripts/winget-install.ps1` removes the portable package once, then installs the MSI.
+   - `windows.yml` builds the MSI on a `win-v*` tag next to the zip.
+5. **Reconnect.** Needs the shell. A dropped link brings the Session back by itself, with the same retries as the Linux viewer; after that the tab says "Disconnected" and a click tries again. It uses the password kept in memory, and asks again only if that fails.
+6. **Clipboard: files and images.** The transfers use upstream's engine in `gliff-transport/src/clipboard/` and need no UI. The progress bar and cancel need the shell. The `walk` path fix and the unused-`mut` fix from step 0 are already carried in `files.rs`. A change to upstream-owned clipboard code follows the rules above.
+
 **M6 — Sync automation.** The weekly upstream-merge CI job and the "needs GNOME mirror" label described above.
 
 ## Difficulties and how we handle them
