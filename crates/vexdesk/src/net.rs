@@ -19,10 +19,12 @@ use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::watch;
 use winit::event_loop::EventLoopProxy;
 
 use crate::clip::{Bridge, FromWin, WinTx};
 use crate::cursor::{payload_fits, CursorShape};
+use crate::layout;
 
 #[cfg(test)]
 mod fake;
@@ -67,6 +69,8 @@ pub enum UiEvent {
     Connected {
         headless: bool,
     },
+    /// A line for the tab, or `None` to clear it.
+    Notice(Option<String>),
     /// The release hotkey was pressed: the keyboard is Windows' again.
     GrabReleased,
     /// The worker ended, with the reason if it failed.
@@ -171,6 +175,7 @@ pub fn spawn(
     ui: Ui,
     input: UnboundedReceiver<ClientMsg>,
     clip: ClipLink,
+    layout: watch::Receiver<String>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("vexdesk-net".into())
@@ -192,7 +197,7 @@ pub fn spawn(
                 // `ssh.child` stays alive until the session ends; dropping it
                 // kills ssh.
                 let _child = ssh.child;
-                session(ssh.stdout, ssh.stdin, &ui, input, clip).await
+                session(ssh.stdout, ssh.stdin, &ui, input, clip, layout).await
             }));
             ui.send(UiEvent::Closed(result.err().map(|e| format!("{e:#}"))));
         })
@@ -240,6 +245,7 @@ async fn session<R, W>(
     ui: &Ui,
     mut input: UnboundedReceiver<ClientMsg>,
     mut clip: ClipLink,
+    mut layout: watch::Receiver<String>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -248,12 +254,17 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
+    // Keys go by position; the keymap the server reads them with is the
+    // window's Windows layout, named in XKB. A switch from here on is sent
+    // once the session is up.
+    let mut keymap = layout::keymap(&layout.borrow_and_update());
+    if keymap.notice.is_some() {
+        ui.send(UiEvent::Notice(keymap.notice.clone()));
+    }
     writer
         .write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
-            // No XKB text from Windows: the server falls back to its own
-            // default layout, and keys are named by position.
-            keymap: String::new(),
+            keymap: keymap.text.clone(),
             caps: ClientCaps {
                 codecs: vec![Codec::H264],
                 max_width: MAX_STREAM.0,
@@ -343,6 +354,7 @@ where
     while clip.events.try_recv().is_ok() {}
     bridge.resync();
     let mut clip_open = true;
+    let mut layout_open = true;
     // The window's input joins the same channel. When the window closes its
     // end, the session is over.
     let (ui_gone_tx, mut ui_gone) = tokio::sync::oneshot::channel::<()>();
@@ -389,6 +401,23 @@ where
                     Some(event) => bridge.on_win(event),
                     None => clip_open = false,
                 }
+                continue;
+            }
+            changed = layout.changed(), if layout_open => {
+                if changed.is_err() {
+                    layout_open = false;
+                    continue;
+                }
+                let next = layout::keymap(&layout.borrow_and_update());
+                if next.text != keymap.text {
+                    tracing::info!(layout = %*layout.borrow(), "keyboard layout switched");
+                    let msg = ClientMsg::Keymap { keymap: next.text.clone() };
+                    let _ = out_tx.send((msg, Bytes::new()));
+                }
+                if next.notice != keymap.notice {
+                    ui.send(UiEvent::Notice(next.notice.clone()));
+                }
+                keymap = next;
                 continue;
             }
             _ = tokio::time::sleep_until(drain_at), if decoder.has_pending() => {
@@ -535,6 +564,10 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::clip::ToWin;
+    use crate::layout::keymap_text;
+
+    const US: &str = "00000409";
+    const GERMAN: &str = "00000407";
 
     #[test]
     fn a_stream_of_another_kind_is_refused() {
@@ -586,7 +619,7 @@ mod tests {
     #[test]
     fn a_session_says_hello_and_shows_the_first_frame() {
         run_local(async {
-            let (mut server, mut window, task) = fake::start();
+            let (mut server, mut window, task) = fake::start(US);
 
             let ClientMsg::Hello {
                 version,
@@ -597,7 +630,7 @@ mod tests {
                 panic!("the session did not open with Hello");
             };
             assert_eq!(version, PROTOCOL_VERSION);
-            assert_eq!(keymap, "");
+            assert_eq!(keymap, keymap_text("us"));
             assert_eq!(caps.codecs, vec![Codec::H264]);
             assert_eq!(caps.chroma, vec![ChromaMode::Single420]);
             assert_eq!((caps.max_width, caps.max_height), (3840, 2160));
@@ -644,9 +677,76 @@ mod tests {
     }
 
     #[test]
+    fn hello_names_the_windows_layout() {
+        run_local(async {
+            let (mut server, mut window, task) = fake::start(GERMAN);
+            let ClientMsg::Hello { keymap, .. } = server.recv().await else {
+                panic!("the session did not open with Hello");
+            };
+            assert_eq!(keymap, keymap_text("de"));
+            server.accept(320, 240).await;
+            assert!(matches!(window.event().await, UiEvent::Connected { .. }));
+            server.drop_stream();
+            fake::ended(task).await.expect("ends cleanly");
+        });
+    }
+
+    #[test]
+    fn a_layout_with_no_entry_falls_back_to_us_and_says_so() {
+        run_local(async {
+            let (mut server, mut window, task) = fake::start("a0000407");
+            let ClientMsg::Hello { keymap, .. } = server.recv().await else {
+                panic!("the session did not open with Hello");
+            };
+            assert_eq!(keymap, keymap_text("us"));
+            let UiEvent::Notice(Some(line)) = window.event().await else {
+                panic!("no notice for the unknown layout");
+            };
+            assert!(line.contains("a0000407") && line.contains("US"), "{line}");
+            server.drop_stream();
+            assert!(fake::ended(task).await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_layout_switch_after_connect_sends_the_new_keymap() {
+        run_local(async {
+            let (mut server, mut window, task) = fake::start(US);
+            assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
+            server.accept(320, 240).await;
+            assert!(matches!(window.event().await, UiEvent::Connected { .. }));
+
+            window.set_layout(GERMAN);
+            let ClientMsg::Keymap { keymap } = server.recv().await else {
+                panic!("no Keymap after the layout switch");
+            };
+            assert_eq!(keymap, keymap_text("de"));
+
+            // To a layout with no entry: US again, and the tab says so.
+            window.set_layout("a0000407");
+            let ClientMsg::Keymap { keymap } = server.recv().await else {
+                panic!("no Keymap after the second switch");
+            };
+            assert_eq!(keymap, keymap_text("us"));
+            assert!(matches!(window.event().await, UiEvent::Notice(Some(_))));
+
+            // Back to a known layout clears the line.
+            window.set_layout(GERMAN);
+            let ClientMsg::Keymap { keymap } = server.recv().await else {
+                panic!("no Keymap after the third switch");
+            };
+            assert_eq!(keymap, keymap_text("de"));
+            assert!(matches!(window.event().await, UiEvent::Notice(None)));
+
+            server.drop_stream();
+            fake::ended(task).await.expect("ends cleanly");
+        });
+    }
+
+    #[test]
     fn closing_the_window_sends_its_bye_and_ends_the_session() {
         run_local(async {
-            let (mut server, mut window, task) = fake::start();
+            let (mut server, mut window, task) = fake::start(US);
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.accept(320, 240).await;
             assert!(matches!(window.event().await, UiEvent::Connected { .. }));
@@ -663,7 +763,7 @@ mod tests {
     #[test]
     fn a_stream_dropped_mid_handshake_ends_the_session() {
         run_local(async {
-            let (mut server, _window, task) = fake::start();
+            let (mut server, _window, task) = fake::start(US);
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.send(fake::hello_ack(false)).await;
             server.drop_stream();
@@ -674,7 +774,7 @@ mod tests {
     #[test]
     fn a_server_error_ends_the_session_with_its_message() {
         run_local(async {
-            let (mut server, mut window, task) = fake::start();
+            let (mut server, mut window, task) = fake::start(US);
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.accept(320, 240).await;
             assert!(matches!(window.event().await, UiEvent::Connected { .. }));

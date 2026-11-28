@@ -22,6 +22,10 @@ gliff-sw.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
 
+# The layout table's test compiles each layout with real XKB data.
+[target.'cfg(unix)'.dev-dependencies]
+xkbcommon.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -29,5 +33,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

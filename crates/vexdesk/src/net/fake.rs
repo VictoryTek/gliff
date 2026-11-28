@@ -15,6 +15,7 @@ use gliff_proto::{
 use gliff_transport::Framed;
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{session, ClipLink, Picture, Slot, Ui, UiEvent};
@@ -127,6 +128,8 @@ pub struct FakeWindow {
     _clip_events: UnboundedSender<FromWin>,
     /// What the session asked of the Windows clipboard thread.
     to_win: std::sync::mpsc::Receiver<ToWin>,
+    /// The Windows keyboard layout, as the window reads it.
+    layout: watch::Sender<String>,
 }
 
 impl FakeWindow {
@@ -160,15 +163,21 @@ impl FakeWindow {
             .expect("the session stopped taking input");
     }
 
+    /// Switch the Windows keyboard layout (a KLID), as Win+Space does.
+    pub fn set_layout(&self, klid: &str) {
+        self.layout.send_replace(klid.to_owned());
+    }
+
     /// Close the window: its input channel goes away.
     pub fn close(&mut self) {
         self.input = None;
     }
 }
 
-/// Start a session against a fake server. Call it inside a `LocalSet`: the
-/// session's clipboard engine spawns local tasks.
-pub fn start() -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
+/// Start a session against a fake server, with the window on the Windows
+/// keyboard layout `klid`. Call it inside a `LocalSet`: the session's
+/// clipboard engine spawns local tasks.
+pub fn start(klid: &str) -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
     let (client, server) = tokio::io::duplex(PIPE);
     let (client_rd, client_wr) = tokio::io::split(client);
     let (server_rd, server_wr) = tokio::io::split(server);
@@ -178,12 +187,13 @@ pub fn start() -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
     let (input_tx, input_rx) = unbounded_channel();
     let (clip_events_tx, clip_events_rx) = unbounded_channel();
     let (win, to_win) = WinTx::detached();
+    let (layout, layout_rx) = watch::channel(klid.to_owned());
     let clip = ClipLink {
         events: clip_events_rx,
         win,
     };
     let task = tokio::task::spawn_local(async move {
-        session(client_rd, client_wr, &ui, input_rx, clip).await
+        session(client_rd, client_wr, &ui, input_rx, clip, layout_rx).await
     });
 
     let server = FakeServer {
@@ -197,6 +207,7 @@ pub fn start() -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
         input: Some(input_tx),
         _clip_events: clip_events_tx,
         to_win,
+        layout,
     };
     (server, window, task)
 }
