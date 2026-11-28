@@ -4,6 +4,8 @@
 //! `ClientMsg`s the session sends back, and watches what reaches the window
 //! through the [`FakeWindow`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -76,6 +78,8 @@ impl FakeServer {
     pub fn drop_stream(self) {}
 }
 
+/// The `HelloAck` of a server showing its `DP-1`, or a **Private screen**
+/// when `headless` (the protocol's name for it).
 pub fn hello_ack(headless: bool) -> ServerMsg {
     ServerMsg::HelloAck {
         version: PROTOCOL_VERSION,
@@ -93,6 +97,7 @@ pub fn hello_ack(headless: bool) -> ServerMsg {
     }
 }
 
+/// The `StreamConfig` of a Single420 H.264 stream of this size, unscaled.
 pub fn stream_config(width: u32, height: u32) -> ServerMsg {
     ServerMsg::StreamConfig {
         codec: Codec::H264,
@@ -113,6 +118,9 @@ pub fn stream_config(width: u32, height: u32) -> ServerMsg {
 pub struct FakeWindow {
     events: UnboundedReceiver<UiEvent>,
     slot: Slot,
+    /// Set while a `UiEvent::Frame` is on its way; the window clears it when
+    /// it takes the picture.
+    notified: Arc<AtomicBool>,
     /// The window's input; `None` once the window has closed.
     input: Option<UnboundedSender<ClientMsg>>,
     /// The clipboard thread's end, held open as the real thread holds it.
@@ -132,6 +140,7 @@ impl FakeWindow {
 
     /// The picture waiting in the slot, taken as the window takes it.
     pub fn take_picture(&self) -> Option<Picture> {
+        self.notified.store(false, Ordering::Release);
         self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
@@ -165,7 +174,7 @@ pub fn start() -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
     let (server_rd, server_wr) = tokio::io::split(server);
 
     let (events_tx, events) = unbounded_channel();
-    let (ui, slot, _notified, _cursor) = Ui::recording(events_tx);
+    let (ui, slot, notified, _cursor) = Ui::recording(events_tx);
     let (input_tx, input_rx) = unbounded_channel();
     let (clip_events_tx, clip_events_rx) = unbounded_channel();
     let (win, to_win) = WinTx::detached();
@@ -184,6 +193,7 @@ pub fn start() -> (FakeServer, FakeWindow, JoinHandle<Result<()>>) {
     let window = FakeWindow {
         events,
         slot,
+        notified,
         input: Some(input_tx),
         _clip_events: clip_events_tx,
         to_win,

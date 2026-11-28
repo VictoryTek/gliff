@@ -558,9 +558,9 @@ mod tests {
         assert!(a.recodes(&resized));
     }
 
-    /// One keyframe of a flat grey picture, as gliff-server's CPU path
-    /// encodes it (Baseline, so the decoder returns it at once).
-    fn keyframe(width: u32, height: u32) -> Vec<u8> {
+    /// A keyframe then a P frame of a flat grey picture, as gliff-server's
+    /// CPU path encodes them (Baseline, so the decoder returns each at once).
+    fn two_frames(width: u32, height: u32) -> [Vec<u8>; 2] {
         let settings = gliff_sw::EncoderSettings {
             width,
             height,
@@ -569,10 +569,13 @@ mod tests {
         };
         let mut encoder = gliff_sw::Encoder::new(settings, false).expect("encoder");
         let grey = vec![0x80u8; (width * height * 4) as usize];
-        encoder.encode_bgra(&grey, true).expect("encode").main
+        let mut encode = |key| encoder.encode_bgra(&grey, key).expect("encode").main;
+        [encode(true), encode(false)]
     }
 
-    fn local<F: std::future::Future>(f: F) -> F::Output {
+    /// Run `f` on a single-threaded runtime inside a `LocalSet`, as `spawn`
+    /// runs the session.
+    fn run_local<F: std::future::Future>(f: F) -> F::Output {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -582,7 +585,7 @@ mod tests {
 
     #[test]
     fn a_session_says_hello_and_shows_the_first_frame() {
-        local(async {
+        run_local(async {
             let (mut server, mut window, task) = fake::start();
 
             let ClientMsg::Hello {
@@ -606,7 +609,8 @@ mod tests {
             ));
             assert!(matches!(window.clipboard_request(), ToWin::Resync));
 
-            server.send_frame(1, true, &keyframe(320, 240)).await;
+            let [first, second] = two_frames(320, 240);
+            server.send_frame(1, true, &first).await;
             assert!(matches!(
                 server.recv().await,
                 ClientMsg::FrameAck { frame_id: 1, .. }
@@ -623,6 +627,15 @@ mod tests {
                 }
             );
 
+            // Once the window has taken a picture, the next one is announced.
+            server.send_frame(2, false, &second).await;
+            assert!(matches!(
+                server.recv().await,
+                ClientMsg::FrameAck { frame_id: 2, .. }
+            ));
+            assert!(matches!(window.event().await, UiEvent::Frame));
+            assert!(window.take_picture().is_some());
+
             server.drop_stream();
             fake::ended(task)
                 .await
@@ -632,7 +645,7 @@ mod tests {
 
     #[test]
     fn closing_the_window_sends_its_bye_and_ends_the_session() {
-        local(async {
+        run_local(async {
             let (mut server, mut window, task) = fake::start();
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.accept(320, 240).await;
@@ -649,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_stream_dropped_mid_handshake_ends_the_session() {
-        local(async {
+        run_local(async {
             let (mut server, _window, task) = fake::start();
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.send(fake::hello_ack(false)).await;
@@ -660,7 +673,7 @@ mod tests {
 
     #[test]
     fn a_server_error_ends_the_session_with_its_message() {
-        local(async {
+        run_local(async {
             let (mut server, mut window, task) = fake::start();
             assert!(matches!(server.recv().await, ClientMsg::Hello { .. }));
             server.accept(320, 240).await;
